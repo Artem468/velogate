@@ -1,36 +1,40 @@
 # VeloGate
 
-VeloGate is a domain-specific compiler and lightweight asynchronous runtime prototype written in Rust. It lets you describe API gateways and BFF endpoints declaratively, infer backend request dependencies, build a DAG execution plan, and configure security and resilience policies without writing imperative orchestration code.
+**VeloGate** — это декларативный шлюз API и высокопроизводительный движок для создания BFF (Backend For Frontend). Он компилирует конфигурационные `.gate` файлы в оптимизированный асинхронный план выполнения, автоматически распределяя независимые запросы по параллельным потокам.
 
-The project currently focuses on the compiler pipeline:
+Вам больше не нужно вручную кодить оркестрацию микросервисов, настраивать ретраи, таймауты и склеивать JSON-ответы в императивном коде. Вы описываете результат, а компилятор решает, как выполнить его максимально быстро.
 
-- a `.gate` DSL lexer and parser;
-- AST construction with interned symbols;
-- syntax diagnostics rendered with `ariadne`;
-- semantic planning with a dependency DAG;
-- parallel execution layers for independent backend calls;
-- AST, JSON, DOT graph, and execution-plan exports.
+---
 
-## Why
+## ⚡ Киллер-фичи
 
-Typical BFF code mixes endpoint shape, backend calls, retries, fallbacks, rate limits, authentication, and response mapping in imperative handlers. VeloGate moves that into a declarative DSL and lets the compiler decide what can run in parallel.
+* **Авто-параллелизм (Auto-DAG):** Компилятор анализирует зависимости между переменными и автоматически группирует независимые запросы в параллельные слои выполнения.
+* **Сквозная отказоустойчивость (Resilience):** Настройка таймаутов, количества повторов (retry), пауз между ними (delay) и дефолтных ответов (fallback) прямо в теле запроса.
+* **Встроенная безопасность (Zero-Code Security):** Декларативная валидация JWT-токенов и ролей, а также встроенный ограничитель частоты запросов (Rate Limiting).
+* **Пайплайны трансформации данных:** Легковесная и быстрая конвейерная обработка массивов (`filter`, `map`, `take`) без бойлерплейта и лишних циклов.
+* **Многодоменный рантайм:** Нативная интеграция с **gRPC (Protobuf)** микросервисами и прямые асинхронные запросы в **Базы Данных (SQL)** на уровне примитивов языка.
+* **Визуализация и валидация:** Полная проверка на дубликаты, циклические зависимости и неизвестные переменные **до** запуска сервера с возможностью экспорта графа выполнения в формат Graphviz (DOT).
 
-For example, if `weather` does not depend on `user`, both requests can be placed in the same execution layer. If `raw_orders` uses `user.id`, it is scheduled after `user`.
+---
 
-## DSL Example
+## 📝 Пример синтаксиса (`main.gate`)
 
-See [examples/main.gate](examples/main.gate):
-
-```gate
+```rust
 gateway "VeloGate-BFF" {
     port: 8080,
-    host: "0.0.0.0"
+    host: "0.0.0.0",
+    
+    // Подключение статических баз данных
+    databases: [
+        Postgres "main_db" { url: "postgres://user:pass@localhost:5432/prod" }
+    ]
 }
 
 endpoint "GET /api/v1/dashboard" {
-    secure: [BearerJWT],
+    secure: [BearerJWT, Roles(["admin"])],
     rate_limit: 100/rps window 1s,
 
+    // Эти два запроса запустятся ОДНОВРЕМЕННО (Слой 0)
     fetch "http://users-service/me" as user {
         timeout: 100ms,
         fallback: { "id": 0, "role": "guest", "name": "Anonymous" }
@@ -41,6 +45,11 @@ endpoint "GET /api/v1/dashboard" {
         fallback: { "temp": 20, "condition": "unknown" }
     };
 
+    // Быстрая проверка прав прямо в БД перед тяжелыми запросами
+    let ban_status = db::query("main_db", "SELECT is_banned FROM blacklist WHERE user_id = $1", user.id)
+        timeout 50ms;
+
+    // Запрос выполнится строго после получения user.id (Слой 1)
     fetch "http://orders-service/list?user_id=" + user.id as raw_orders {
         timeout: 500ms,
         retry: 2 times,
@@ -48,6 +57,7 @@ endpoint "GET /api/v1/dashboard" {
         fallback: { "orders": [] }
     };
 
+    // Трансформация и фильтрация массива данных "на лету" (Слой 2)
     let top_orders = raw_orders.orders
         | filter(order => order.status == "completed" || order.total > 500)
         | map(order => {
@@ -57,9 +67,10 @@ endpoint "GET /api/v1/dashboard" {
           })
         | take(3);
 
+    // Сборка идеального ответа для фронтенда
     respond 200 {
         "user_name": user.name,
-        "is_admin": user.role == "admin",
+        "is_banned": ban_status.is_banned,
         "weather": {
             "celsius": weather.temp,
             "status": weather.condition
@@ -69,119 +80,63 @@ endpoint "GET /api/v1/dashboard" {
 }
 ```
 
-## DAG Planning
+---
 
-VeloGate builds an execution plan from endpoint steps. Each step declares one produced variable, and expressions inside later steps declare dependencies by reading variables.
+## 🗺️ Как это работает (План слоев)
 
-For the example above:
+Для примера выше компилятор VeloGate автоматически выстроит следующую схему выполнения:
 
 ```text
 layer 0: user, weather
-layer 1: raw_orders
+layer 1: ban_status, raw_orders
 layer 2: top_orders
 ```
 
-This means `user` and `weather` can run concurrently. `raw_orders` waits for `user`, and `top_orders` waits for `raw_orders`.
+---
 
-The planner also validates:
+## 🛠️ Руководство по использованию CLI
 
-- duplicate produced variables;
-- undefined variable reads;
-- cyclic dependency graphs.
+Утилита работает в трех режимах: проверка, запуск и экспорт отладочной информации.
 
-## Install And Build
-
-Requirements:
-
-- Rust stable with Cargo.
-
-Build:
-
+### 1. Проверка конфигурации (Линтер)
+Проверяет `.gate` файл на синтаксические ошибки, опечатки в переменных и циклические зависимости без запуска сервера. В случае ошибки выводит красивый подсвеченный отчет.
 ```powershell
-cargo build
+velogate check --config ./main.gate
 ```
 
-Run tests:
+### 2. Запуск шлюза в продакшн
+Запускает высокопроизводительный веб-сервер и открывает порты. Можно явно указать количество выделенных процессорных потоков.
+```powershell
+velogate start --config ./main.gate --workers 4
+```
 
+### 3. Экспорт внутренних данных (Dump)
+Помогает понять, как компилятор видит ваш код, и экспортирует его в разные форматы.
+
+* **Просмотр AST-дерева:**
+  ```powershell
+  velogate dump --config ./main.gate --format ast
+  ```
+* **Экспорт плана выполнения слоев в JSON:**
+  ```powershell
+  velogate dump --config ./main.gate --format plan
+  ```
+* **Генерация DOT-графа для визуализации в Graphviz/Mermaid:**
+  ```powershell
+  velogate dump --config ./main.gate --format graph
+  ```
+
+---
+
+## 🚀 Быстрый старт
+
+### Сборка проекта
+Для сборки вам понадобится установленный компилятор Rust (Stable).
+```powershell
+cargo build --release
+```
+
+### Запуск тестов
 ```powershell
 cargo test
 ```
-
-Run clippy:
-
-```powershell
-cargo clippy --all-targets --all-features -- -D warnings
-```
-
-## CLI
-
-```text
-Usage: velogate <COMMAND>
-
-Commands:
-  check  Validate a .gate file without starting the server
-  start  Start the API gateway runtime
-  dump   Export internal representation
-```
-
-Validate syntax and semantic execution plan:
-
-```powershell
-cargo run -- check --config .\examples\main.gate
-```
-
-Export readable AST:
-
-```powershell
-cargo run -- dump --config .\examples\main.gate --format ast
-```
-
-Export JSON AST:
-
-```powershell
-cargo run -- dump --config .\examples\main.gate --format json
-```
-
-Export execution plan:
-
-```powershell
-cargo run -- dump --config .\examples\main.gate --format plan
-```
-
-Export DOT graph:
-
-```powershell
-cargo run -- dump --config .\examples\main.gate --format graph
-```
-
-## Current Status
-
-Implemented:
-
-- parsing gateway and endpoint declarations;
-- endpoint options: `secure`, `rate_limit`;
-- fetch steps with timeout, retry, delay, fallback;
-- object and array literals;
-- property access and method calls;
-- filter/map/take pipelines;
-- dependency DAG planning;
-- plan and graph export;
-- syntax and planning validation.
-
-In progress / next steps:
-
-- actual HTTP runtime executor from `ExecutionPlan`;
-- request context and response value model;
-- auth middleware generation from `secure`;
-- rate-limit middleware generation;
-- typed fallback validation;
-- better source spans for semantic planner errors.
-
-## Project Goal
-
-The long-term goal is to compile declarative BFF/API gateway descriptions into a fast async runtime plan:
-
-- no hand-written orchestration for independent backend calls;
-- predictable dependency scheduling;
-- explicit resilience policies;
-- simple exportable plans for debugging and optimization.

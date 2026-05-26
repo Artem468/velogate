@@ -8,6 +8,7 @@ use velogate::ast::FileAST;
 use velogate::export::export_file;
 use velogate::parser::{ParseDiagnostic, Parser};
 use velogate::planner::{ExecutionPlan, PlanError, build_plan, export_plan_dot};
+use velogate::runtime::Runtime;
 
 #[derive(ClapParser, Debug)]
 #[command(name = "velogate")]
@@ -118,7 +119,7 @@ fn dump(args: DumpArgs) -> Result<(), ()> {
 }
 
 fn start(args: StartArgs) -> Result<(), ()> {
-    let _ = parse_config(&args.config)?;
+    let ParsedConfig { ast, parser, plan } = parse_config(&args.config)?;
 
     let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
     runtime_builder.enable_all();
@@ -135,8 +136,9 @@ fn start(args: StartArgs) -> Result<(), ()> {
         let actual_workers = tokio::runtime::Handle::current().metrics().num_workers();
         println!("velogate runtime started with {actual_workers} worker threads");
 
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            eprintln!("failed to listen for ctrl-c: {err}");
+        let runtime = Runtime::new(ast, parser.interner, plan);
+        if let Err(err) = runtime.serve().await {
+            eprintln!("{err}");
         }
         println!("velogate runtime stopped");
     });

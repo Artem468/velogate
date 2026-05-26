@@ -3,4 +3,5 @@ pub mod export;
 pub mod parser;
 pub mod planner;
 
-pub(crate) mod lexer;
+pub mod lexer;
+pub mod runtime;
