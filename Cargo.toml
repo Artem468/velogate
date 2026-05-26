@@ -27,3 +27,11 @@ serde_json = "1.0"
 
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.6.11", features = ["limit", "timeout"] }
+sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "any", "postgres", "mysql", "sqlite"] }
+tonic = "0.14.6"
+prost = "0.14.3"
+prost-types = "0.14.3"
+http = "1.4.1"
+tonic-prost = "0.14.6"
+prost-reflect = { version = "0.16.4", features = ["serde"] }
+protox = "0.9.1"

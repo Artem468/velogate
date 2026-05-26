@@ -140,7 +140,7 @@ mod tests {
 
             endpoint "GET /v1/users" {
                 let min_age = 18;
-                let rows = db::query("select * from users where age >= $1", min_age);
+                let rows = db::query("sqlite::memory:", "select * from users where age >= ?", min_age);
                 respond 200 {
                     "adult": min_age >= 18,
                     "rows": rows
@@ -152,6 +152,56 @@ mod tests {
         let ast = parser.parse(source).expect("valid DSL should parse");
 
         assert_eq!(ast.endpoints[0].steps.len(), 2);
-        assert!(matches!(ast.endpoints[0].steps[1], Step::Let { .. }));
+        assert!(matches!(ast.endpoints[0].steps[1], Step::QueryDb { .. }));
+    }
+
+    #[test]
+    fn parses_grpc_call_step() {
+        let source = r#"
+            gateway "api" { port: 8080 }
+
+            endpoint "POST /v1/profile" {
+                let payload = { "id": 42 };
+                let profile = grpc::call("http://profiles:50051/profile.Profile/Get", payload);
+                respond 200 { "profile": profile }
+            }
+        "#;
+
+        let mut parser = Parser::new(Rodeo::new());
+        let ast = parser.parse(source).expect("valid DSL should parse");
+
+        assert_eq!(ast.endpoints[0].steps.len(), 2);
+        assert!(matches!(ast.endpoints[0].steps[1], Step::CallGrpc { .. }));
+    }
+
+    #[test]
+    fn parses_grpc_call_step_with_proto_path() {
+        let source = r#"
+            gateway "api" {
+                port: 8080,
+                protos: [
+                    proto "profile_proto" { path: "./proto/profile.proto" }
+                ],
+            }
+
+            endpoint "POST /v1/profile" {
+                let payload = { "id": 42 };
+                let profile = grpc::call(
+                    "http://profiles:50051",
+                    "profile_proto",
+                    "profile.Profile",
+                    "Get",
+                    payload
+                );
+                respond 200 { "profile": profile }
+            }
+        "#;
+
+        let mut parser = Parser::new(Rodeo::new());
+        let ast = parser.parse(source).expect("valid DSL should parse");
+
+        assert_eq!(ast.gateway.static_protos.len(), 1);
+        assert_eq!(ast.endpoints[0].steps.len(), 2);
+        assert!(matches!(ast.endpoints[0].steps[1], Step::CallGrpc { .. }));
     }
 }

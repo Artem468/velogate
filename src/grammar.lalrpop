@@ -14,14 +14,16 @@ GatewayConfig: GatewayConfig = {
         let mut port = 0;
         let mut host = None;
         let mut static_dbs = Vec::new();
+        let mut static_protos = Vec::new();
         for item in items {
             match item {
                 GatewayItem::Port(value) => port = value,
                 GatewayItem::Host(value) => host = Some(value),
                 GatewayItem::Databases(value) => static_dbs = value,
+                GatewayItem::Protos(value) => static_protos = value,
             }
         }
-        GatewayConfig { name, port, host, static_dbs }
+        GatewayConfig { name, port, host, static_dbs, static_protos }
     }
 };
 
@@ -29,6 +31,7 @@ GatewayItem: GatewayItem = {
     "port" ":" <port:Int> ","? => GatewayItem::Port(port as u16),
     "host" ":" <host:String> ","? => GatewayItem::Host(host),
     "databases" ":" "[" <dbs:StaticDbList> "]" ","? => GatewayItem::Databases(dbs),
+    "protos" ":" "[" <protos:StaticProtoList> "]" ","? => GatewayItem::Protos(protos),
 };
 
 StaticDbList: Vec<StaticDb> = {
@@ -42,6 +45,20 @@ StaticDb: StaticDb = {
     <_type_ident:Ident> <name_str:String> "{" "url" ":" <url:String> ","? "}" => {
         let name = interner.get_or_intern(&name_str);
         StaticDb { name, url }
+    }
+};
+
+StaticProtoList: Vec<StaticProto> = {
+    <mut v:(<StaticProto> ",")*> <e:StaticProto?> => {
+        if let Some(last) = e { v.push(last); }
+        v
+    }
+};
+
+StaticProto: StaticProto = {
+    <_type_ident:Ident> <name_str:String> "{" "path" ":" <path:String> ","? "}" => {
+        let name = interner.get_or_intern(&name_str);
+        StaticProto { name, path }
     }
 };
 
@@ -108,6 +125,49 @@ Step: Step = {
             }
         }
     },
+    "let" <var:Ident> "=" "db" "::" "query" "(" <db_source:Expression> "," <sql:String> <params:DbQueryParams> ")" <cfg:FetchConfigBlock?> ";" => {
+        let cfg = cfg.unwrap_or_default();
+        Step::QueryDb {
+            var_name: interner.get_or_intern(&var),
+            config: DbQueryConfig {
+                db_source,
+                sql,
+                params,
+                timeout_ms: cfg.timeout_ms,
+                fallback: cfg.fallback,
+            }
+        }
+    },
+    "let" <var:Ident> "=" "grpc" "::" "call" "(" <target:String> "," <proto_path:String> "," <service:String> "," <method:String> "," <payload:Expression> ")" <cfg:FetchConfigBlock?> ";" => {
+        let cfg = cfg.unwrap_or_default();
+        Step::CallGrpc {
+            var_name: interner.get_or_intern(&var),
+            config: GrpcConfig {
+                service_method: target,
+                proto_path: Some(proto_path),
+                service: Some(service),
+                method: Some(method),
+                payload,
+                timeout_ms: cfg.timeout_ms,
+                fallback: cfg.fallback,
+            }
+        }
+    },
+    "let" <var:Ident> "=" "grpc" "::" "call" "(" <service_method:String> "," <payload:Expression> ")" <cfg:FetchConfigBlock?> ";" => {
+        let cfg = cfg.unwrap_or_default();
+        Step::CallGrpc {
+            var_name: interner.get_or_intern(&var),
+            config: GrpcConfig {
+                service_method,
+                proto_path: None,
+                service: None,
+                method: None,
+                payload,
+                timeout_ms: cfg.timeout_ms,
+                fallback: cfg.fallback,
+            }
+        }
+    },
     "let" <var:Ident> "=" <source:Expression> <operations:PipeOp+> ";" => {
         Step::Pipe {
             var_name: interner.get_or_intern(&var),
@@ -121,6 +181,11 @@ Step: Step = {
             value,
         }
     },
+};
+
+DbQueryParams: Vec<Expression> = {
+    "," <params:CallArgs> => params,
+    => Vec::new(),
 };
 
 PipeOp: PipeOp = {
@@ -276,13 +341,19 @@ extern {
         "gateway" => Token::Gateway,
         "endpoint" => Token::Endpoint,
         "databases" => Token::Databases,
+        "protos" => Token::Protos,
         "port" => Token::Port,
         "host" => Token::Host,
         "url" => Token::Url,
+        "path" => Token::Path,
         "secure" => Token::Secure,
         "rate_limit" => Token::RateLimit,
         "let" => Token::Let,
         "fetch" => Token::Fetch,
+        "db" => Token::Db,
+        "query" => Token::Query,
+        "grpc" => Token::Grpc,
+        "call" => Token::Call,
         "as" => Token::As,
         "respond" => Token::Respond,
         "timeout" => Token::Timeout,

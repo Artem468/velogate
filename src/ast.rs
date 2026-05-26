@@ -10,12 +10,19 @@ pub struct GatewayConfig {
     pub port: u16,
     pub host: Option<String>,
     pub static_dbs: Vec<StaticDb>,
+    pub static_protos: Vec<StaticProto>,
 }
 
 #[derive(Debug, Clone)]
 pub struct StaticDb {
     pub name: Sym,   // Интернированное имя базы
     pub url: String, // Строка подключения
+}
+
+#[derive(Debug, Clone)]
+pub struct StaticProto {
+    pub name: Sym,
+    pub path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -80,11 +87,15 @@ pub(crate) enum GatewayItem {
     Port(u16),
     Host(String),
     Databases(Vec<StaticDb>),
+    Protos(Vec<StaticProto>),
 }
 
 #[derive(Debug, Clone)]
 pub struct GrpcConfig {
     pub service_method: String,
+    pub proto_path: Option<String>,
+    pub service: Option<String>,
+    pub method: Option<String>,
     pub payload: Expression,
     pub timeout_ms: Option<u64>,
     pub fallback: Option<Expression>,

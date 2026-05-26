@@ -15,12 +15,19 @@ pub struct GatewayExport {
     pub port: u16,
     pub host: Option<String>,
     pub static_dbs: Vec<StaticDbExport>,
+    pub static_protos: Vec<StaticProtoExport>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct StaticDbExport {
     pub name: String,
     pub url: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StaticProtoExport {
+    pub name: String,
+    pub path: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -84,6 +91,9 @@ pub struct HttpConfigExport {
 #[derive(Debug, Serialize)]
 pub struct GrpcConfigExport {
     pub service_method: String,
+    pub proto_path: Option<String>,
+    pub service: Option<String>,
+    pub method: Option<String>,
     pub payload: ExprExport,
     pub timeout_ms: Option<u64>,
     pub fallback: Option<ExprExport>,
@@ -163,6 +173,15 @@ pub fn export_file(ast: &FileAST, interner: &Rodeo) -> FileExport {
                 .map(|db| StaticDbExport {
                     name: sym(interner, db.name),
                     url: db.url.clone(),
+                })
+                .collect(),
+            static_protos: ast
+                .gateway
+                .static_protos
+                .iter()
+                .map(|proto| StaticProtoExport {
+                    name: sym(interner, proto.name),
+                    path: proto.path.clone(),
                 })
                 .collect(),
         },
@@ -253,6 +272,9 @@ fn export_step(step: &Step, interner: &Rodeo) -> StepExport {
             var_name: sym(interner, *var_name),
             config: GrpcConfigExport {
                 service_method: config.service_method.clone(),
+                proto_path: config.proto_path.clone(),
+                service: config.service.clone(),
+                method: config.method.clone(),
                 payload: export_expr(&config.payload, interner),
                 timeout_ms: config.timeout_ms,
                 fallback: config

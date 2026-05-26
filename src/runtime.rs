@@ -1,18 +1,41 @@
-use crate::ast::{BinaryOperator, Endpoint, Expression, FileAST, HttpConfig, PipeOp, Step, Sym};
+use crate::ast::{
+    BinaryOperator, DbQueryConfig, Endpoint, EndpointOption, Expression, FileAST, GrpcConfig,
+    HttpConfig, PipeOp, Step, Sym,
+};
 use crate::planner::{EndpointPlan, ExecutionPlan};
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{Request, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodFilter, on};
 use axum::{Json, Router};
 use lasso::Rodeo;
+use prost::Message;
+use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
+use prost_types::{ListValue, Struct, Value as ProstValue, value::Kind};
 use reqwest::Client;
-use serde_json::{Map, Value, json};
-use std::collections::HashMap;
+use serde_json::{Map, Value as JsonValue, json};
+use sqlx::any::{AnyPoolOptions, install_default_drivers};
+use sqlx::{AnyPool, Column, Row, TypeInfo};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Once;
+use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::task::JoinSet;
+use tokio::time::Instant;
+use tonic::Status;
+use tonic::client::Grpc;
+use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+use tonic::transport::{Channel, Endpoint as TonicEndpoint};
+use tonic_prost::ProstCodec;
+use tower::{Layer, Service};
 
 #[derive(Clone)]
 pub struct Runtime {
@@ -20,6 +43,10 @@ pub struct Runtime {
     interner: Arc<Rodeo>,
     plan: Arc<ExecutionPlan>,
     client: Client,
+    db_urls: Arc<HashMap<String, String>>,
+    db_pools: Arc<Mutex<HashMap<String, AnyPool>>>,
+    proto_paths: Arc<HashMap<String, String>>,
+    proto_pools: Arc<Mutex<HashMap<String, DescriptorPool>>>,
 }
 
 #[derive(Debug)]
@@ -31,16 +58,39 @@ pub enum RuntimeError {
     Execution(String),
 }
 
-type Vars = HashMap<Sym, Value>;
+type Vars = HashMap<Sym, JsonValue>;
+type Value = JsonValue;
 type RuntimeResult<T> = Result<T, RuntimeError>;
+static SQLX_DRIVERS: Once = Once::new();
+
+#[derive(Clone)]
+struct SecurePolicy {
+    schemes: Vec<String>,
+}
+
+#[derive(Clone)]
+struct RateLimitPolicy {
+    limit: u32,
+    window: Duration,
+    state: Arc<Mutex<RateLimitState>>,
+}
+
+struct RateLimitState {
+    started_at: Instant,
+    used: u32,
+}
 
 impl Runtime {
     pub fn new(ast: FileAST, interner: Rodeo, plan: ExecutionPlan) -> Self {
         Self {
+            db_urls: Arc::new(db_urls(&ast, &interner)),
+            proto_paths: Arc::new(proto_paths(&ast, &interner)),
             ast: Arc::new(ast),
             interner: Arc::new(interner),
             plan: Arc::new(plan),
             client: Client::new(),
+            db_pools: Arc::new(Mutex::new(HashMap::new())),
+            proto_pools: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -86,6 +136,10 @@ impl Runtime {
                 interner: Arc::clone(&self.interner),
                 client: self.client.clone(),
                 static_dbs: static_dbs(&self.ast),
+                db_urls: Arc::clone(&self.db_urls),
+                db_pools: Arc::clone(&self.db_pools),
+                proto_paths: Arc::clone(&self.proto_paths),
+                proto_pools: Arc::clone(&self.proto_pools),
             });
             let method =
                 method_filter(&endpoint.method).ok_or_else(|| RuntimeError::InvalidMethod {
@@ -93,17 +147,126 @@ impl Runtime {
                     path: endpoint.path.clone(),
                 })?;
             let handler_runtime = Arc::clone(&endpoint_runtime);
+            let mut method_router = on(method, move || {
+                let runtime = Arc::clone(&handler_runtime);
+                async move { runtime.handle().await }
+            });
 
-            router = router.route(
-                &endpoint.path,
-                on(method, move || {
-                    let runtime = Arc::clone(&handler_runtime);
-                    async move { runtime.handle().await }
-                }),
-            );
+            if let Some(policy) = endpoint_rate_limit_policy(endpoint) {
+                method_router = method_router.layer(VelogateRateLimitLayer::new(policy));
+            }
+
+            if let Some(policy) = endpoint_secure_policy(endpoint, &self.interner) {
+                method_router =
+                    method_router.layer(middleware::from_fn_with_state(policy, secure_middleware));
+            }
+
+            router = router.route(&endpoint.path, method_router);
         }
 
         Ok(router)
+    }
+}
+
+async fn secure_middleware(
+    State(policy): State<SecurePolicy>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if policy.schemes.iter().any(|scheme| scheme == "BearerJWT") {
+        let authorized = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|token| !token.trim().is_empty());
+
+        if !authorized {
+            let body = json!({
+                "error": "unauthorized",
+                "message": "missing or invalid bearer token",
+            });
+            return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+        }
+    }
+
+    next.run(request).await
+}
+
+#[derive(Clone)]
+struct VelogateRateLimitLayer {
+    policy: RateLimitPolicy,
+}
+
+impl VelogateRateLimitLayer {
+    fn new(policy: RateLimitPolicy) -> Self {
+        Self { policy }
+    }
+}
+
+impl<S> Layer<S> for VelogateRateLimitLayer {
+    type Service = VelogateRateLimitService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        VelogateRateLimitService {
+            inner,
+            policy: self.policy.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct VelogateRateLimitService<S> {
+    inner: S,
+    policy: RateLimitPolicy,
+}
+
+impl<S> Service<Request<Body>> for VelogateRateLimitService<S>
+where
+    S: Service<Request<Body>, Response = Response> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+{
+    type Response = Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        let mut inner = self.inner.clone();
+        let policy = self.policy.clone();
+
+        Box::pin(async move {
+            if rate_limited(&policy).await {
+                let body = json!({
+                    "error": "rate_limited",
+                    "message": "request rate limit exceeded",
+                });
+                return Ok((StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response());
+            }
+
+            inner.call(request).await
+        })
+    }
+}
+
+async fn rate_limited(policy: &RateLimitPolicy) -> bool {
+    let mut state = policy.state.lock().await;
+    let now = Instant::now();
+
+    if now.duration_since(state.started_at) >= policy.window {
+        state.started_at = now;
+        state.used = 0;
+    }
+
+    if state.used >= policy.limit {
+        true
+    } else {
+        state.used += 1;
+        false
     }
 }
 
@@ -113,6 +276,18 @@ struct EndpointRuntime {
     interner: Arc<Rodeo>,
     client: Client,
     static_dbs: Vars,
+    db_urls: Arc<HashMap<String, String>>,
+    db_pools: Arc<Mutex<HashMap<String, AnyPool>>>,
+    proto_paths: Arc<HashMap<String, String>>,
+    proto_pools: Arc<Mutex<HashMap<String, DescriptorPool>>>,
+}
+
+struct StepRuntimeDeps<'a> {
+    client: &'a Client,
+    db_urls: &'a HashMap<String, String>,
+    db_pools: &'a Mutex<HashMap<String, AnyPool>>,
+    proto_paths: &'a HashMap<String, String>,
+    proto_pools: &'a Mutex<HashMap<String, DescriptorPool>>,
 }
 
 impl EndpointRuntime {
@@ -148,10 +323,21 @@ impl EndpointRuntime {
                 let ctx = Arc::clone(&snapshot);
                 let interner = Arc::clone(&self.interner);
                 let client = self.client.clone();
+                let db_urls = Arc::clone(&self.db_urls);
+                let db_pools = Arc::clone(&self.db_pools);
+                let proto_paths = Arc::clone(&self.proto_paths);
+                let proto_pools = Arc::clone(&self.proto_pools);
 
                 tasks.spawn(async move {
                     let var = step_var(&step);
-                    let value = execute_step(&step, &ctx, &interner, &client).await?;
+                    let deps = StepRuntimeDeps {
+                        client: &client,
+                        db_urls: &db_urls,
+                        db_pools: &db_pools,
+                        proto_paths: &proto_paths,
+                        proto_pools: &proto_pools,
+                    };
+                    let value = execute_step(&step, &ctx, &interner, &deps).await?;
                     RuntimeResult::Ok((var, value))
                 });
             }
@@ -171,32 +357,20 @@ async fn execute_step(
     step: &Step,
     vars: &Vars,
     interner: &Rodeo,
-    client: &Client,
+    deps: &StepRuntimeDeps<'_>,
 ) -> RuntimeResult<Value> {
     match step {
         Step::Let { value, .. } => eval_expr(value, vars, interner),
-        Step::FetchHttp { config, .. } => fetch_http(config, vars, interner, client).await,
+        Step::FetchHttp { config, .. } => fetch_http(config, vars, interner, deps.client).await,
         Step::Pipe {
             source, operations, ..
         } => execute_pipe(source, operations, vars, interner),
-        Step::CallGrpc { config, .. } => config
-            .fallback
-            .as_ref()
-            .map(|fallback| eval_expr(fallback, vars, interner))
-            .unwrap_or_else(|| {
-                Err(RuntimeError::Execution(
-                    "grpc calls are not implemented in this runtime yet".to_string(),
-                ))
-            }),
-        Step::QueryDb { config, .. } => config
-            .fallback
-            .as_ref()
-            .map(|fallback| eval_expr(fallback, vars, interner))
-            .unwrap_or_else(|| {
-                Err(RuntimeError::Execution(
-                    "database queries are not implemented in this runtime yet".to_string(),
-                ))
-            }),
+        Step::CallGrpc { config, .. } => {
+            call_grpc(config, vars, interner, deps.proto_paths, deps.proto_pools).await
+        }
+        Step::QueryDb { config, .. } => {
+            query_db(config, vars, interner, deps.db_urls, deps.db_pools).await
+        }
     }
 }
 
@@ -248,6 +422,473 @@ async fn fetch_http(
         "fetch {url} failed: {}",
         last_error.unwrap_or_else(|| "unknown error".to_string())
     )))
+}
+
+async fn query_db(
+    config: &DbQueryConfig,
+    vars: &Vars,
+    interner: &Rodeo,
+    db_urls: &HashMap<String, String>,
+    db_pools: &Mutex<HashMap<String, AnyPool>>,
+) -> RuntimeResult<Value> {
+    let source = as_string(eval_expr(&config.db_source, vars, interner)?);
+    let url = db_urls.get(&source).cloned().unwrap_or(source);
+    let params = config
+        .params
+        .iter()
+        .map(|param| eval_expr(param, vars, interner))
+        .collect::<RuntimeResult<Vec<_>>>()?;
+
+    let work = async {
+        let pool = get_db_pool(&url, db_pools).await?;
+        let mut query = sqlx::query(&config.sql);
+
+        for param in params {
+            query = bind_json_value(query, param);
+        }
+
+        let rows = query
+            .fetch_all(&pool)
+            .await
+            .map_err(|err| RuntimeError::Execution(format!("database query failed: {err}")))?;
+        rows.into_iter()
+            .map(row_to_json)
+            .collect::<RuntimeResult<Vec<_>>>()
+            .map(Value::Array)
+    };
+
+    let result = if let Some(timeout_ms) = config.timeout_ms {
+        tokio::time::timeout(Duration::from_millis(timeout_ms), work)
+            .await
+            .map_err(|_| RuntimeError::Execution("database query timed out".to_string()))?
+    } else {
+        work.await
+    };
+
+    match result {
+        Ok(value) => Ok(value),
+        Err(err) => match &config.fallback {
+            Some(fallback) => eval_expr(fallback, vars, interner),
+            None => Err(err),
+        },
+    }
+}
+
+async fn get_db_pool(
+    url: &str,
+    db_pools: &Mutex<HashMap<String, AnyPool>>,
+) -> RuntimeResult<AnyPool> {
+    SQLX_DRIVERS.call_once(install_default_drivers);
+
+    if let Some(pool) = db_pools.lock().await.get(url).cloned() {
+        return Ok(pool);
+    }
+
+    let pool = AnyPoolOptions::new()
+        .max_connections(5)
+        .connect(url)
+        .await
+        .map_err(|err| RuntimeError::Execution(format!("failed to connect to database: {err}")))?;
+    db_pools.lock().await.insert(url.to_string(), pool.clone());
+    Ok(pool)
+}
+
+fn bind_json_value<'q>(
+    query: sqlx::query::Query<'q, sqlx::Any, sqlx::any::AnyArguments<'q>>,
+    value: Value,
+) -> sqlx::query::Query<'q, sqlx::Any, sqlx::any::AnyArguments<'q>> {
+    match value {
+        Value::Null => query.bind(Option::<String>::None),
+        Value::Bool(value) => query.bind(value),
+        Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                query.bind(value)
+            } else if let Some(value) = value.as_u64().and_then(|value| i64::try_from(value).ok()) {
+                query.bind(value)
+            } else {
+                query.bind(value.as_f64().unwrap_or_default())
+            }
+        }
+        Value::String(value) => query.bind(value),
+        Value::Array(value) => query.bind(Value::Array(value).to_string()),
+        Value::Object(value) => query.bind(Value::Object(value).to_string()),
+    }
+}
+
+fn row_to_json(row: sqlx::any::AnyRow) -> RuntimeResult<Value> {
+    let mut object = Map::new();
+
+    for (idx, column) in row.columns().iter().enumerate() {
+        let value = decode_column(&row, idx).map_err(|err| {
+            RuntimeError::Execution(format!(
+                "failed to decode column `{}` ({}) as JSON value: {err}",
+                column.name(),
+                column.type_info().name()
+            ))
+        })?;
+        object.insert(column.name().to_string(), value);
+    }
+
+    Ok(Value::Object(object))
+}
+
+fn decode_column(row: &sqlx::any::AnyRow, idx: usize) -> Result<Value, sqlx::Error> {
+    if let Ok(value) = row.try_get::<Option<i64>, _>(idx) {
+        return Ok(value.map_or(Value::Null, |value| json!(value)));
+    }
+    if let Ok(value) = row.try_get::<Option<f64>, _>(idx) {
+        return Ok(value.map_or(Value::Null, |value| json!(value)));
+    }
+    if let Ok(value) = row.try_get::<Option<bool>, _>(idx) {
+        return Ok(value.map(Value::Bool).unwrap_or(Value::Null));
+    }
+    if let Ok(value) = row.try_get::<Option<String>, _>(idx) {
+        return Ok(value.map_or(Value::Null, Value::String));
+    }
+    if let Ok(value) = row.try_get::<Option<Vec<u8>>, _>(idx) {
+        return Ok(value
+            .map(|value| Value::String(String::from_utf8_lossy(&value).into()))
+            .unwrap_or(Value::Null));
+    }
+
+    row.try_get::<Option<String>, _>(idx)
+        .map(|value| value.map_or(Value::Null, Value::String))
+}
+
+async fn call_grpc(
+    config: &GrpcConfig,
+    vars: &Vars,
+    interner: &Rodeo,
+    proto_paths: &HashMap<String, String>,
+    proto_pools: &Mutex<HashMap<String, DescriptorPool>>,
+) -> RuntimeResult<Value> {
+    let payload = eval_expr(&config.payload, vars, interner)?;
+
+    let work = async {
+        let channel = grpc_channel(&config.service_method).await?;
+        if config.proto_path.is_some() {
+            call_grpc_dynamic(channel, config, payload, proto_paths, proto_pools).await
+        } else {
+            let request = GrpcRequest::parse(&config.service_method)?;
+            call_grpc_struct(channel, &request.method, payload).await
+        }
+    };
+
+    let result = if let Some(timeout_ms) = config.timeout_ms {
+        tokio::time::timeout(Duration::from_millis(timeout_ms), work)
+            .await
+            .map_err(|_| RuntimeError::Execution("grpc call timed out".to_string()))?
+    } else {
+        work.await
+    };
+
+    match result {
+        Ok(value) => Ok(value),
+        Err(err) => match &config.fallback {
+            Some(fallback) => eval_expr(fallback, vars, interner),
+            None => Err(err),
+        },
+    }
+}
+
+async fn grpc_channel(target: &str) -> RuntimeResult<Channel> {
+    let endpoint = grpc_endpoint(target)?;
+    TonicEndpoint::from_shared(endpoint)
+        .map_err(|err| RuntimeError::Execution(format!("invalid grpc endpoint: {err}")))?
+        .connect()
+        .await
+        .map_err(|err| RuntimeError::Execution(format!("failed to connect grpc: {err}")))
+}
+
+fn grpc_endpoint(target: &str) -> RuntimeResult<String> {
+    let endpoint = if let Some(rest) = target.strip_prefix("http://") {
+        let host = rest.split_once('/').map_or(rest, |(host, _)| host);
+        format!("http://{host}")
+    } else if let Some(rest) = target.strip_prefix("https://") {
+        let host = rest.split_once('/').map_or(rest, |(host, _)| host);
+        format!("https://{host}")
+    } else if let Some((host, _)) = target.split_once('/') {
+        format!("http://{host}")
+    } else {
+        format!("http://{target}")
+    };
+
+    Ok(endpoint)
+}
+
+struct GrpcRequest {
+    method: String,
+}
+
+impl GrpcRequest {
+    fn parse(value: &str) -> RuntimeResult<Self> {
+        let rest = if let Some(rest) = value.strip_prefix("http://") {
+            rest
+        } else if let Some(rest) = value.strip_prefix("https://") {
+            rest
+        } else {
+            value
+        };
+
+        let Some((target, method)) = rest.split_once('/') else {
+            return Err(RuntimeError::Execution(
+                "grpc method must look like `host:port/package.Service/Method`".to_string(),
+            ));
+        };
+
+        if target.is_empty() || method.is_empty() {
+            return Err(RuntimeError::Execution(
+                "grpc target and method must not be empty".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            method: method.to_string(),
+        })
+    }
+}
+
+async fn call_grpc_dynamic(
+    channel: Channel,
+    config: &GrpcConfig,
+    payload: Value,
+    proto_paths: &HashMap<String, String>,
+    proto_pools: &Mutex<HashMap<String, DescriptorPool>>,
+) -> RuntimeResult<Value> {
+    let proto_source = config
+        .proto_path
+        .as_deref()
+        .ok_or_else(|| RuntimeError::Execution("missing grpc proto source".to_string()))?;
+    let proto_path = proto_paths
+        .get(proto_source)
+        .map(String::as_str)
+        .unwrap_or(proto_source);
+    let service_name = config
+        .service
+        .as_deref()
+        .ok_or_else(|| RuntimeError::Execution("missing grpc service name".to_string()))?;
+    let method_name = config
+        .method
+        .as_deref()
+        .ok_or_else(|| RuntimeError::Execution("missing grpc method name".to_string()))?;
+
+    let method = load_grpc_method(proto_path, service_name, method_name, proto_pools).await?;
+    if method.is_client_streaming() || method.is_server_streaming() {
+        return Err(RuntimeError::Execution(
+            "only unary grpc methods are supported".to_string(),
+        ));
+    }
+
+    let input = dynamic_message_from_json(method.input(), payload)?;
+    let output = method.output();
+    let path = http::uri::PathAndQuery::from_maybe_shared(format!(
+        "/{}/{}",
+        method.parent_service().full_name(),
+        method.name()
+    ))
+    .map_err(|err| RuntimeError::Execution(format!("invalid grpc method path: {err}")))?;
+
+    let mut grpc = Grpc::new(channel);
+    let response = grpc
+        .unary(
+            tonic::Request::new(input),
+            path,
+            DynamicGrpcCodec::new(output),
+        )
+        .await
+        .map_err(|err| RuntimeError::Execution(format!("grpc call failed: {err}")))?;
+
+    dynamic_message_to_json(&response.into_inner())
+}
+
+async fn load_grpc_method(
+    proto_path: &str,
+    service_name: &str,
+    method_name: &str,
+    proto_pools: &Mutex<HashMap<String, DescriptorPool>>,
+) -> RuntimeResult<prost_reflect::MethodDescriptor> {
+    let pool = get_proto_pool(proto_path, proto_pools).await?;
+    let service = pool.get_service_by_name(service_name).ok_or_else(|| {
+        RuntimeError::Execution(format!("grpc service `{service_name}` not found in proto"))
+    })?;
+
+    service
+        .methods()
+        .find(|method| method.name() == method_name)
+        .ok_or_else(|| {
+            RuntimeError::Execution(format!(
+                "grpc method `{method_name}` not found in service `{service_name}`"
+            ))
+        })
+}
+
+async fn get_proto_pool(
+    proto_path: &str,
+    proto_pools: &Mutex<HashMap<String, DescriptorPool>>,
+) -> RuntimeResult<DescriptorPool> {
+    if let Some(pool) = proto_pools.lock().await.get(proto_path).cloned() {
+        return Ok(pool);
+    }
+
+    let path = std::path::PathBuf::from(proto_path);
+    let include = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let descriptor_set = protox::compile([&path], [include]).map_err(|err| {
+        RuntimeError::Execution(format!("failed to compile proto `{proto_path}`: {err}"))
+    })?;
+    let pool = DescriptorPool::from_file_descriptor_set(descriptor_set).map_err(|err| {
+        RuntimeError::Execution(format!("failed to load proto descriptors: {err}"))
+    })?;
+    proto_pools
+        .lock()
+        .await
+        .insert(proto_path.to_string(), pool.clone());
+    Ok(pool)
+}
+
+fn dynamic_message_from_json(
+    desc: MessageDescriptor,
+    value: Value,
+) -> RuntimeResult<DynamicMessage> {
+    let json = value.to_string();
+    let mut deserializer = serde_json::Deserializer::from_str(&json);
+    let message = DynamicMessage::deserialize(desc, &mut deserializer).map_err(|err| {
+        RuntimeError::Execution(format!("failed to encode grpc payload from JSON: {err}"))
+    })?;
+    deserializer.end().map_err(|err| {
+        RuntimeError::Execution(format!("invalid trailing JSON in grpc payload: {err}"))
+    })?;
+    Ok(message)
+}
+
+fn dynamic_message_to_json(message: &DynamicMessage) -> RuntimeResult<Value> {
+    serde_json::to_value(message)
+        .map_err(|err| RuntimeError::Execution(format!("failed to decode grpc response: {err}")))
+}
+
+#[derive(Clone)]
+struct DynamicGrpcCodec {
+    output: MessageDescriptor,
+}
+
+impl DynamicGrpcCodec {
+    fn new(output: MessageDescriptor) -> Self {
+        Self { output }
+    }
+}
+
+impl Codec for DynamicGrpcCodec {
+    type Encode = DynamicMessage;
+    type Decode = DynamicMessage;
+    type Encoder = DynamicGrpcEncoder;
+    type Decoder = DynamicGrpcDecoder;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        DynamicGrpcEncoder
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        DynamicGrpcDecoder {
+            output: self.output.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DynamicGrpcEncoder;
+
+impl Encoder for DynamicGrpcEncoder {
+    type Item = DynamicMessage;
+    type Error = Status;
+
+    fn encode(&mut self, item: Self::Item, buf: &mut EncodeBuf<'_>) -> Result<(), Self::Error> {
+        item.encode(buf)
+            .map_err(|err| Status::internal(err.to_string()))
+    }
+}
+
+#[derive(Clone)]
+struct DynamicGrpcDecoder {
+    output: MessageDescriptor,
+}
+
+impl Decoder for DynamicGrpcDecoder {
+    type Item = DynamicMessage;
+    type Error = Status;
+
+    fn decode(&mut self, buf: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
+        DynamicMessage::decode(self.output.clone(), buf)
+            .map(Some)
+            .map_err(|err| Status::internal(err.to_string()))
+    }
+}
+
+async fn call_grpc_struct(channel: Channel, method: &str, payload: Value) -> RuntimeResult<Value> {
+    let mut grpc = Grpc::new(channel);
+    let path = http::uri::PathAndQuery::from_maybe_shared(format!("/{method}"))
+        .map_err(|err| RuntimeError::Execution(format!("invalid grpc method path: {err}")))?;
+    let codec = ProstCodec::<Struct, Struct>::default();
+    let request = tonic::Request::new(json_to_prost_struct(payload)?);
+    let response = grpc
+        .unary(request, path, codec)
+        .await
+        .map_err(|err| RuntimeError::Execution(format!("grpc call failed: {err}")))?;
+
+    Ok(prost_struct_to_json(response.into_inner()))
+}
+
+fn json_to_prost_struct(value: Value) -> RuntimeResult<Struct> {
+    match json_to_prost_value(value)?.kind {
+        Some(Kind::StructValue(value)) => Ok(value),
+        _ => Err(RuntimeError::Execution(
+            "grpc payload must be a JSON object for google.protobuf.Struct calls".to_string(),
+        )),
+    }
+}
+
+fn json_to_prost_value(value: Value) -> RuntimeResult<ProstValue> {
+    let kind = match value {
+        Value::Null => Kind::NullValue(0),
+        Value::Bool(value) => Kind::BoolValue(value),
+        Value::Number(value) => Kind::NumberValue(value.as_f64().unwrap_or_default()),
+        Value::String(value) => Kind::StringValue(value),
+        Value::Array(items) => Kind::ListValue(ListValue {
+            values: items
+                .into_iter()
+                .map(json_to_prost_value)
+                .collect::<RuntimeResult<Vec<_>>>()?,
+        }),
+        Value::Object(fields) => Kind::StructValue(Struct {
+            fields: fields
+                .into_iter()
+                .map(|(key, value)| json_to_prost_value(value).map(|value| (key, value)))
+                .collect::<RuntimeResult<BTreeMap<_, _>>>()?,
+        }),
+    };
+
+    Ok(ProstValue { kind: Some(kind) })
+}
+
+fn prost_struct_to_json(value: Struct) -> Value {
+    Value::Object(
+        value
+            .fields
+            .into_iter()
+            .map(|(key, value)| (key, prost_value_to_json(value)))
+            .collect(),
+    )
+}
+
+fn prost_value_to_json(value: ProstValue) -> Value {
+    match value.kind {
+        Some(Kind::NullValue(_)) | None => Value::Null,
+        Some(Kind::NumberValue(value)) => json!(value),
+        Some(Kind::StringValue(value)) => Value::String(value),
+        Some(Kind::BoolValue(value)) => Value::Bool(value),
+        Some(Kind::StructValue(value)) => prost_struct_to_json(value),
+        Some(Kind::ListValue(value)) => {
+            Value::Array(value.values.into_iter().map(prost_value_to_json).collect())
+        }
+    }
 }
 
 fn execute_pipe(
@@ -365,20 +1006,8 @@ fn eval_call(
                 ))),
             }
         }
-        Expression::PropertyAccess(object, method)
-            if matches!(&**object, Expression::Variable(name) if sym(interner, *name) == "db")
-                && sym(interner, *method) == "query" =>
-        {
-            Ok(json!({
-                "unsupported": "db::query",
-                "args": args
-                    .iter()
-                    .map(|arg| eval_expr(arg, vars, interner))
-                    .collect::<RuntimeResult<Vec<_>>>()?,
-            }))
-        }
         _ => Err(RuntimeError::Execution(
-            "only len() and db::query(...) calls are supported".to_string(),
+            "only len() calls are supported inside expressions".to_string(),
         )),
     }
 }
@@ -478,6 +1107,22 @@ fn static_dbs(ast: &FileAST) -> Vars {
         .collect()
 }
 
+fn db_urls(ast: &FileAST, interner: &Rodeo) -> HashMap<String, String> {
+    ast.gateway
+        .static_dbs
+        .iter()
+        .map(|db| (sym(interner, db.name).to_string(), db.url.clone()))
+        .collect()
+}
+
+fn proto_paths(ast: &FileAST, interner: &Rodeo) -> HashMap<String, String> {
+    ast.gateway
+        .static_protos
+        .iter()
+        .map(|proto| (sym(interner, proto.name).to_string(), proto.path.clone()))
+        .collect()
+}
+
 fn step_var(step: &Step) -> Sym {
     match step {
         Step::Let { var_name, .. }
@@ -486,6 +1131,34 @@ fn step_var(step: &Step) -> Sym {
         | Step::QueryDb { var_name, .. }
         | Step::Pipe { var_name, .. } => *var_name,
     }
+}
+
+fn endpoint_rate_limit_policy(endpoint: &Endpoint) -> Option<RateLimitPolicy> {
+    endpoint.options.iter().find_map(|option| match option {
+        EndpointOption::RateLimit {
+            limit, window_ms, ..
+        } => Some(RateLimitPolicy {
+            limit: *limit,
+            window: Duration::from_millis(*window_ms),
+            state: Arc::new(Mutex::new(RateLimitState {
+                started_at: Instant::now(),
+                used: 0,
+            })),
+        }),
+        EndpointOption::Secure(_) => None,
+    })
+}
+
+fn endpoint_secure_policy(endpoint: &Endpoint, interner: &Rodeo) -> Option<SecurePolicy> {
+    endpoint.options.iter().find_map(|option| match option {
+        EndpointOption::Secure(schemes) => Some(SecurePolicy {
+            schemes: schemes
+                .iter()
+                .map(|scheme| sym(interner, *scheme).to_string())
+                .collect(),
+        }),
+        EndpointOption::RateLimit { .. } => None,
+    })
 }
 
 fn method_filter(method: &str) -> Option<MethodFilter> {
@@ -600,5 +1273,145 @@ mod tests {
                 ]
             })
         );
+    }
+
+    #[tokio::test]
+    async fn generated_axum_route_executes_database_query() {
+        let source = r#"
+            gateway "test" {
+                port: 0,
+                databases: [
+                    sqlite "main" { url: "sqlite::memory:" }
+                ],
+            }
+
+            endpoint "GET /db" {
+                let rows = db::query("main", "select ? as answer, ? as label", 42, "ok");
+
+                respond 200 {
+                    "rows": rows
+                }
+            }
+        "#;
+
+        let mut parser = Parser::new(Rodeo::new());
+        let ast = parser.parse(source).expect("test DSL should parse");
+        let plan = build_plan(&ast, &parser.interner).expect("test DSL should plan");
+        let router = Runtime::new(ast, parser.interner, plan)
+            .router()
+            .expect("router should build");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/db")
+                    .body(axum::body::Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body should read");
+        let actual: Value = serde_json::from_slice(&body).expect("body should be JSON");
+
+        assert_eq!(
+            actual,
+            json!({
+                "rows": [
+                    {
+                        "answer": 42.0,
+                        "label": "ok"
+                    }
+                ]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn secure_endpoint_requires_bearer_token() {
+        let source = r#"
+            gateway "test" { port: 0 }
+
+            endpoint "GET /secure" {
+                secure: [BearerJWT],
+                respond 200 { "ok": true }
+            }
+        "#;
+
+        let router = test_router(source);
+
+        let unauthorized = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/secure")
+                    .body(axum::body::Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = router
+            .oneshot(
+                Request::builder()
+                    .uri("/secure")
+                    .header("authorization", "Bearer token")
+                    .body(axum::body::Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(authorized.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_endpoint_returns_429_after_limit() {
+        let source = r#"
+            gateway "test" { port: 0 }
+
+            endpoint "GET /limited" {
+                rate_limit: 1/rps window 1s,
+                respond 200 { "ok": true }
+            }
+        "#;
+
+        let router = test_router(source);
+
+        let first = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/limited")
+                    .body(axum::body::Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = router
+            .oneshot(
+                Request::builder()
+                    .uri("/limited")
+                    .body(axum::body::Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    fn test_router(source: &str) -> axum::Router {
+        let mut parser = Parser::new(Rodeo::new());
+        let ast = parser.parse(source).expect("test DSL should parse");
+        let plan = build_plan(&ast, &parser.interner).expect("test DSL should plan");
+        Runtime::new(ast, parser.interner, plan)
+            .router()
+            .expect("router should build")
     }
 }

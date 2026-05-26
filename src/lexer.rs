@@ -17,12 +17,16 @@ pub(crate) enum Token {
     Endpoint,
     #[token("databases")]
     Databases,
+    #[token("protos")]
+    Protos,
     #[token("port")]
     Port,
     #[token("host")]
     Host,
     #[token("url")]
     Url,
+    #[token("path")]
+    Path,
     #[token("window")]
     Window,
 
@@ -34,6 +38,14 @@ pub(crate) enum Token {
     Let,
     #[token("fetch")]
     Fetch,
+    #[token("db")]
+    Db,
+    #[token("query")]
+    Query,
+    #[token("grpc")]
+    Grpc,
+    #[token("call")]
+    Call,
     #[token("as")]
     As,
     #[token("if")]
