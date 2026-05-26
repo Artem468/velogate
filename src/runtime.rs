@@ -4,8 +4,8 @@ use crate::ast::{
 };
 use crate::planner::{EndpointPlan, ExecutionPlan};
 use axum::body::Body;
-use axum::extract::State;
-use axum::http::{Request, StatusCode, header};
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodFilter, on};
@@ -147,10 +147,15 @@ impl Runtime {
                     path: endpoint.path.clone(),
                 })?;
             let handler_runtime = Arc::clone(&endpoint_runtime);
-            let mut method_router = on(method, move || {
-                let runtime = Arc::clone(&handler_runtime);
-                async move { runtime.handle().await }
-            });
+            let mut method_router = on(
+                method,
+                move |Path(path_params): Path<HashMap<String, String>>,
+                      Query(query_params): Query<HashMap<String, String>>,
+                      headers: HeaderMap| {
+                    let runtime = Arc::clone(&handler_runtime);
+                    async move { runtime.handle(path_params, query_params, headers).await }
+                },
+            );
 
             if let Some(policy) = endpoint_rate_limit_policy(endpoint) {
                 method_router = method_router.layer(VelogateRateLimitLayer::new(policy));
@@ -161,7 +166,7 @@ impl Runtime {
                     method_router.layer(middleware::from_fn_with_state(policy, secure_middleware));
             }
 
-            router = router.route(&endpoint.path, method_router);
+            router = router.route(&axum_route_path(&endpoint.path), method_router);
         }
 
         Ok(router)
@@ -291,8 +296,13 @@ struct StepRuntimeDeps<'a> {
 }
 
 impl EndpointRuntime {
-    async fn handle(self: Arc<Self>) -> Response {
-        match self.execute().await {
+    async fn handle(
+        self: Arc<Self>,
+        path_params: HashMap<String, String>,
+        query_params: HashMap<String, String>,
+        headers: HeaderMap,
+    ) -> Response {
+        match self.execute(path_params, query_params, &headers).await {
             Ok(value) => {
                 let status =
                     StatusCode::from_u16(self.endpoint.response_status).unwrap_or(StatusCode::OK);
@@ -308,8 +318,19 @@ impl EndpointRuntime {
         }
     }
 
-    async fn execute(&self) -> RuntimeResult<Value> {
+    async fn execute(
+        &self,
+        path_params: HashMap<String, String>,
+        query_params: HashMap<String, String>,
+        headers: &HeaderMap,
+    ) -> RuntimeResult<Value> {
         let mut vars = self.static_dbs.clone();
+        vars.extend(request_vars(
+            &path_params,
+            &query_params,
+            headers,
+            &self.interner,
+        ));
 
         for layer in &self.plan.layers {
             let snapshot = Arc::new(vars.clone());
@@ -1028,6 +1049,7 @@ fn eval_binary(left: Value, op: BinaryOperator, right: Value) -> RuntimeResult<V
         BinaryOperator::Sub => Ok(json!(as_f64(&left)? - as_f64(&right)?)),
         BinaryOperator::Mul => Ok(json!(as_f64(&left)? * as_f64(&right)?)),
         BinaryOperator::Div => Ok(json!(as_f64(&left)? / as_f64(&right)?)),
+        BinaryOperator::Mod => Ok(json!(as_f64(&left)? % as_f64(&right)?)),
         BinaryOperator::Eq => Ok(Value::Bool(left == right)),
         BinaryOperator::Neq => Ok(Value::Bool(left != right)),
         BinaryOperator::Gt => Ok(Value::Bool(as_f64(&left)? > as_f64(&right)?)),
@@ -1105,6 +1127,99 @@ fn static_dbs(ast: &FileAST) -> Vars {
         .iter()
         .map(|db| (db.name, Value::String(db.url.clone())))
         .collect()
+}
+
+fn request_vars(
+    path_params: &HashMap<String, String>,
+    query_params: &HashMap<String, String>,
+    headers: &HeaderMap,
+    interner: &Rodeo,
+) -> Vars {
+    let mut vars = Vars::new();
+
+    for (key, value) in path_params {
+        insert_string_var(&mut vars, interner, key, value.clone());
+    }
+
+    insert_object_var(
+        &mut vars,
+        interner,
+        "query",
+        normalized_object(query_params),
+    );
+    insert_object_var(
+        &mut vars,
+        interner,
+        "headers",
+        headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value.to_str().ok().map(|value| {
+                    (
+                        normalize_key(name.as_str()),
+                        Value::String(value.to_string()),
+                    )
+                })
+            })
+            .collect(),
+    );
+    insert_object_var(
+        &mut vars,
+        interner,
+        "cookies",
+        headers
+            .get(header::COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .map(parse_cookies)
+            .unwrap_or_default(),
+    );
+
+    vars
+}
+
+fn insert_string_var(vars: &mut Vars, interner: &Rodeo, name: &str, value: String) {
+    if let Some(sym) = interner.get(name) {
+        vars.insert(sym, Value::String(value));
+    }
+}
+
+fn insert_object_var(vars: &mut Vars, interner: &Rodeo, name: &str, value: Map<String, Value>) {
+    if let Some(sym) = interner.get(name) {
+        vars.insert(sym, Value::Object(value));
+    }
+}
+
+fn normalized_object(params: &HashMap<String, String>) -> Map<String, Value> {
+    params
+        .iter()
+        .map(|(key, value)| (normalize_key(key), Value::String(value.clone())))
+        .collect()
+}
+
+fn parse_cookies(header: &str) -> Map<String, Value> {
+    header
+        .split(';')
+        .filter_map(|part| {
+            let (key, value) = part.trim().split_once('=')?;
+            Some((normalize_key(key), Value::String(value.to_string())))
+        })
+        .collect()
+}
+
+fn normalize_key(key: &str) -> String {
+    key.replace('-', "_")
+}
+
+fn axum_route_path(path: &str) -> String {
+    path.split('/')
+        .map(|segment| {
+            segment
+                .strip_prefix(':')
+                .map(|name| format!("{{{name}}}"))
+                .unwrap_or_else(|| segment.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn db_urls(ast: &FileAST, interner: &Rodeo) -> HashMap<String, String> {
@@ -1404,6 +1519,99 @@ mod tests {
             .await
             .expect("route should respond");
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn request_context_exposes_path_query_headers_and_cookies() {
+        let source = r#"
+            gateway "test" { port: 0 }
+
+            endpoint "GET /api/v1/todos/:id" {
+                respond 200 {
+                    "id": id,
+                    "arg": query.arg,
+                    "trace": headers.x_trace_id,
+                    "session": cookies.session
+                }
+            }
+        "#;
+
+        let router = test_router(source);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/todos/42?arg=1")
+                    .header("x-trace-id", "abc")
+                    .header("cookie", "session=s1; theme=dark")
+                    .body(axum::body::Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body should read");
+        let actual: Value = serde_json::from_slice(&body).expect("body should be JSON");
+
+        assert_eq!(
+            actual,
+            json!({
+                "id": "42",
+                "arg": "1",
+                "trace": "abc",
+                "session": "s1"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn modulo_operator_evaluates_remainder() {
+        let source = r#"
+            gateway "test" { port: 0 }
+
+            endpoint "GET /math" {
+                let value = 10 % 4;
+                let mixed = 10 + 5 % 3 * 2;
+
+                respond 200 {
+                    "value": value,
+                    "mixed": mixed,
+                    "is_odd": value == 1
+                }
+            }
+        "#;
+
+        let router = test_router(source);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/math")
+                    .body(axum::body::Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body should read");
+        let actual: Value = serde_json::from_slice(&body).expect("body should be JSON");
+
+        assert_eq!(
+            actual,
+            json!({
+                "value": 2.0,
+                "mixed": 14.0,
+                "is_odd": false
+            })
+        );
     }
 
     fn test_router(source: &str) -> axum::Router {

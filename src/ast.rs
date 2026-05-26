@@ -47,6 +47,7 @@ pub enum BinaryOperator {
     Sub,
     Mul,
     Div,
+    Mod,
     Eq,
     Neq,
     Gt,

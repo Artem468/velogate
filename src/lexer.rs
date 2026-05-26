@@ -126,6 +126,8 @@ pub(crate) enum Token {
     Star,
     #[token("/")]
     Slash,
+    #[token("%")]
+    Percent,
     #[token("|")]
     Pipe,
     #[token("=>")]

@@ -151,7 +151,7 @@ fn build_endpoint_plan(
         let reads = step_reads(step);
         let mut dependencies = BTreeSet::new();
         for read in reads {
-            if globals.contains(&read) {
+            if globals.contains(&read) || is_endpoint_context_var(read, endpoint, interner) {
                 continue;
             }
 
@@ -170,7 +170,10 @@ fn build_endpoint_plan(
 
     let response_reads = response_reads(endpoint);
     for read in &response_reads {
-        if !globals.contains(read) && !produced_by.contains_key(read) {
+        if !globals.contains(read)
+            && !is_endpoint_context_var(*read, endpoint, interner)
+            && !produced_by.contains_key(read)
+        {
             return Err(PlanError::UndefinedVariable {
                 endpoint: endpoint_name,
                 variable: sym(interner, *read),
@@ -357,6 +360,18 @@ fn collect_call_callee_reads(
     }
 }
 
+fn is_endpoint_context_var(name: Sym, endpoint: &Endpoint, interner: &Rodeo) -> bool {
+    let name = interner.resolve(&name);
+    matches!(name, "query" | "headers" | "cookies")
+        || route_param_names(&endpoint.path).any(|param| param == name)
+}
+
+fn route_param_names(path: &str) -> impl Iterator<Item = &str> {
+    path.split('/')
+        .filter_map(|segment| segment.strip_prefix(':'))
+        .filter(|name| !name.is_empty())
+}
+
 fn sym(interner: &Rodeo, name: Sym) -> String {
     interner.resolve(&name).to_string()
 }
@@ -373,10 +388,20 @@ mod tests {
 
     #[test]
     fn builds_parallel_layers_for_independent_fetches() {
-        let source = include_str!("../examples/main.gate");
+        let source = r#"
+            gateway "api" { port: 8080 }
+
+            endpoint "GET /x" {
+                let user = { "id": 1 };
+                let weather = { "temp": 20 };
+                let user_id = user.id;
+                let label = user_id + 1;
+                respond 200 { "label": label, "weather": weather.temp }
+            }
+        "#;
         let mut parser = Parser::new(Rodeo::new());
-        let ast = parser.parse(source).expect("main.gate should parse");
-        let plan = build_plan(&ast, &parser.interner).expect("main.gate should plan");
+        let ast = parser.parse(source).expect("source should parse");
+        let plan = build_plan(&ast, &parser.interner).expect("source should plan");
         let endpoint = &plan.endpoints[0];
 
         assert_eq!(endpoint.layers, vec![vec![0, 1], vec![2], vec![3]]);

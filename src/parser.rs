@@ -204,4 +204,22 @@ mod tests {
         assert_eq!(ast.endpoints[0].steps.len(), 2);
         assert!(matches!(ast.endpoints[0].steps[1], Step::CallGrpc { .. }));
     }
+
+    #[test]
+    fn parses_empty_endpoint_as_default_response() {
+        let source = r#"
+            gateway "api" { port: 8080 }
+
+            endpoint "GET /api/v1/todos/:id" {
+            }
+        "#;
+
+        let mut parser = Parser::new(Rodeo::new());
+        let ast = parser.parse(source).expect("empty endpoint should parse");
+
+        assert_eq!(ast.endpoints[0].method, "GET");
+        assert_eq!(ast.endpoints[0].path, "/api/v1/todos/:id");
+        assert_eq!(ast.endpoints[0].response_status, 200);
+        assert!(ast.endpoints[0].response_body.is_empty());
+    }
 }

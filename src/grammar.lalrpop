@@ -63,19 +63,25 @@ StaticProto: StaticProto = {
 };
 
 Endpoint: Endpoint = {
-    "endpoint" <path_method:String> "{" <options:EndpointOption*> <steps:Step*> "respond" <status:Int> "{" <body:ResponseObject> "}" "}" => {
+    "endpoint" <path_method:String> "{" <options:EndpointOption*> <steps:Step*> <response:EndpointResponse> "}" => {
         let mut parts = path_method.split_whitespace();
         let method = parts.next().unwrap_or("GET").to_string();
         let path = parts.next().unwrap_or("/").to_string();
+        let (response_status, response_body) = response;
         Endpoint {
             method,
             path,
             options,
             steps,
-            response_status: status as u16,
-            response_body: body,
+            response_status,
+            response_body,
         }
     }
+};
+
+EndpointResponse: (u16, HashMap<String, Expression>) = {
+    "respond" <status:Int> "{" <body:ResponseObject> "}" => (status as u16, body),
+    => (200, HashMap::new()),
 };
 
 EndpointOption: EndpointOption = {
@@ -295,6 +301,7 @@ Term: Expression = {
 Factor: Expression = {
     <l:Factor> "*" <r:Postfix> => Expression::BinaryOp(Box::new(l), BinaryOperator::Mul, Box::new(r)),
     <l:Factor> "/" <r:Postfix> => Expression::BinaryOp(Box::new(l), BinaryOperator::Div, Box::new(r)),
+    <l:Factor> "%" <r:Postfix> => Expression::BinaryOp(Box::new(l), BinaryOperator::Mod, Box::new(r)),
     Postfix
 };
 
@@ -306,6 +313,7 @@ Postfix: Expression = {
 
 Primary: Expression = {
     <path:PathExpr> => path,
+    "query" => Expression::Variable(interner.get_or_intern("query")),
     <n:Int> => Expression::Number(n as f64),
     <f:Float> => Expression::Number(f),
     <s:String> => Expression::String(s),
@@ -383,6 +391,7 @@ extern {
         "-" => Token::Minus,
         "*" => Token::Star,
         "/" => Token::Slash,
+        "%" => Token::Percent,
         "|" => Token::Pipe,
         "=>" => Token::Arrow,
         ">=" => Token::Gte,
