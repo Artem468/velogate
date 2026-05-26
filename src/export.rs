@@ -1,0 +1,474 @@
+use crate::ast::*;
+use lasso::Rodeo;
+use serde::Serialize;
+use std::collections::BTreeMap;
+
+#[derive(Debug, Serialize)]
+pub struct FileExport {
+    pub gateway: GatewayExport,
+    pub endpoints: Vec<EndpointExport>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GatewayExport {
+    pub name: String,
+    pub port: u16,
+    pub host: Option<String>,
+    pub static_dbs: Vec<StaticDbExport>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StaticDbExport {
+    pub name: String,
+    pub url: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EndpointExport {
+    pub method: String,
+    pub path: String,
+    pub options: Vec<EndpointOptionExport>,
+    pub steps: Vec<StepExport>,
+    pub response_status: u16,
+    pub response_body: BTreeMap<String, ExprExport>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EndpointOptionExport {
+    Secure {
+        schemes: Vec<String>,
+    },
+    RateLimit {
+        limit: u32,
+        unit: String,
+        window_ms: u64,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StepExport {
+    Let {
+        var_name: String,
+        value: ExprExport,
+    },
+    FetchHttp {
+        var_name: String,
+        config: HttpConfigExport,
+    },
+    CallGrpc {
+        var_name: String,
+        config: GrpcConfigExport,
+    },
+    QueryDb {
+        var_name: String,
+        config: DbQueryConfigExport,
+    },
+    Pipe {
+        var_name: String,
+        source: ExprExport,
+        operations: Vec<PipeOpExport>,
+    },
+}
+
+#[derive(Debug, Serialize)]
+pub struct HttpConfigExport {
+    pub url: ExprExport,
+    pub timeout_ms: Option<u64>,
+    pub retries: Option<u32>,
+    pub delay_ms: Option<u64>,
+    pub fallback: Option<ExprExport>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GrpcConfigExport {
+    pub service_method: String,
+    pub payload: ExprExport,
+    pub timeout_ms: Option<u64>,
+    pub fallback: Option<ExprExport>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DbQueryConfigExport {
+    pub db_source: ExprExport,
+    pub sql: String,
+    pub params: Vec<ExprExport>,
+    pub timeout_ms: Option<u64>,
+    pub fallback: Option<ExprExport>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PipeOpExport {
+    Filter {
+        param: String,
+        condition: ExprExport,
+    },
+    Map {
+        param: String,
+        layout: BTreeMap<String, ExprExport>,
+    },
+    Take {
+        count: usize,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExprExport {
+    Variable {
+        name: String,
+    },
+    Number {
+        value: f64,
+    },
+    String {
+        value: String,
+    },
+    Boolean {
+        value: bool,
+    },
+    Object {
+        fields: BTreeMap<String, ExprExport>,
+    },
+    Array {
+        items: Vec<ExprExport>,
+    },
+    PropertyAccess {
+        object: Box<ExprExport>,
+        field: String,
+    },
+    Call {
+        callee: Box<ExprExport>,
+        args: Vec<ExprExport>,
+    },
+    BinaryOp {
+        left: Box<ExprExport>,
+        op: &'static str,
+        right: Box<ExprExport>,
+    },
+}
+
+pub fn export_file(ast: &FileAST, interner: &Rodeo) -> FileExport {
+    FileExport {
+        gateway: GatewayExport {
+            name: ast.gateway.name.clone(),
+            port: ast.gateway.port,
+            host: ast.gateway.host.clone(),
+            static_dbs: ast
+                .gateway
+                .static_dbs
+                .iter()
+                .map(|db| StaticDbExport {
+                    name: sym(interner, db.name),
+                    url: db.url.clone(),
+                })
+                .collect(),
+        },
+        endpoints: ast
+            .endpoints
+            .iter()
+            .map(|endpoint| export_endpoint(endpoint, interner))
+            .collect(),
+    }
+}
+
+pub fn export_dot(ast: &FileAST, interner: &Rodeo) -> String {
+    let mut out = String::from("digraph velogate {\n  rankdir=LR;\n");
+    out.push_str(&format!(
+        "  gateway [label=\"gateway {}:{}\"];\n",
+        dot_escape(&ast.gateway.name),
+        ast.gateway.port
+    ));
+
+    for endpoint in &ast.endpoints {
+        let endpoint_node = format!("endpoint_{}_{}", endpoint.method, endpoint.path)
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>();
+        out.push_str(&format!(
+            "  {endpoint_node} [label=\"{} {}\"];\n  gateway -> {endpoint_node};\n",
+            dot_escape(&endpoint.method),
+            dot_escape(&endpoint.path)
+        ));
+
+        for step in &endpoint.steps {
+            let (var, deps) = step_var_and_deps(step, interner);
+            out.push_str(&format!("  \"{var}\" [shape=box];\n"));
+            out.push_str(&format!("  {endpoint_node} -> \"{var}\";\n"));
+            for dep in deps {
+                out.push_str(&format!("  \"{dep}\" -> \"{var}\";\n"));
+            }
+        }
+    }
+
+    out.push_str("}\n");
+    out
+}
+
+fn export_endpoint(endpoint: &Endpoint, interner: &Rodeo) -> EndpointExport {
+    EndpointExport {
+        method: endpoint.method.clone(),
+        path: endpoint.path.clone(),
+        options: endpoint
+            .options
+            .iter()
+            .map(|option| export_endpoint_option(option, interner))
+            .collect(),
+        steps: endpoint
+            .steps
+            .iter()
+            .map(|step| export_step(step, interner))
+            .collect(),
+        response_status: endpoint.response_status,
+        response_body: endpoint
+            .response_body
+            .iter()
+            .map(|(key, value)| (key.clone(), export_expr(value, interner)))
+            .collect(),
+    }
+}
+
+fn export_step(step: &Step, interner: &Rodeo) -> StepExport {
+    match step {
+        Step::Let { var_name, value } => StepExport::Let {
+            var_name: sym(interner, *var_name),
+            value: export_expr(value, interner),
+        },
+        Step::FetchHttp { var_name, config } => StepExport::FetchHttp {
+            var_name: sym(interner, *var_name),
+            config: HttpConfigExport {
+                url: export_expr(&config.url, interner),
+                timeout_ms: config.timeout_ms,
+                retries: config.retries,
+                delay_ms: config.delay_ms,
+                fallback: config
+                    .fallback
+                    .as_ref()
+                    .map(|expr| export_expr(expr, interner)),
+            },
+        },
+        Step::CallGrpc { var_name, config } => StepExport::CallGrpc {
+            var_name: sym(interner, *var_name),
+            config: GrpcConfigExport {
+                service_method: config.service_method.clone(),
+                payload: export_expr(&config.payload, interner),
+                timeout_ms: config.timeout_ms,
+                fallback: config
+                    .fallback
+                    .as_ref()
+                    .map(|expr| export_expr(expr, interner)),
+            },
+        },
+        Step::QueryDb { var_name, config } => StepExport::QueryDb {
+            var_name: sym(interner, *var_name),
+            config: DbQueryConfigExport {
+                db_source: export_expr(&config.db_source, interner),
+                sql: config.sql.clone(),
+                params: config
+                    .params
+                    .iter()
+                    .map(|expr| export_expr(expr, interner))
+                    .collect(),
+                timeout_ms: config.timeout_ms,
+                fallback: config
+                    .fallback
+                    .as_ref()
+                    .map(|expr| export_expr(expr, interner)),
+            },
+        },
+        Step::Pipe {
+            var_name,
+            source,
+            operations,
+        } => StepExport::Pipe {
+            var_name: sym(interner, *var_name),
+            source: export_expr(source, interner),
+            operations: operations
+                .iter()
+                .map(|op| export_pipe_op(op, interner))
+                .collect(),
+        },
+    }
+}
+
+fn export_endpoint_option(option: &EndpointOption, interner: &Rodeo) -> EndpointOptionExport {
+    match option {
+        EndpointOption::Secure(items) => EndpointOptionExport::Secure {
+            schemes: items.iter().map(|item| sym(interner, *item)).collect(),
+        },
+        EndpointOption::RateLimit {
+            limit,
+            unit,
+            window_ms,
+        } => EndpointOptionExport::RateLimit {
+            limit: *limit,
+            unit: sym(interner, *unit),
+            window_ms: *window_ms,
+        },
+    }
+}
+
+fn export_pipe_op(op: &PipeOp, interner: &Rodeo) -> PipeOpExport {
+    match op {
+        PipeOp::Filter { param, condition } => PipeOpExport::Filter {
+            param: sym(interner, *param),
+            condition: export_expr(condition, interner),
+        },
+        PipeOp::Map { param, layout } => PipeOpExport::Map {
+            param: sym(interner, *param),
+            layout: layout
+                .iter()
+                .map(|(key, value)| (key.clone(), export_expr(value, interner)))
+                .collect(),
+        },
+        PipeOp::Take(count) => PipeOpExport::Take { count: *count },
+    }
+}
+
+fn export_expr(expr: &Expression, interner: &Rodeo) -> ExprExport {
+    match expr {
+        Expression::Variable(name) => ExprExport::Variable {
+            name: sym(interner, *name),
+        },
+        Expression::Number(value) => ExprExport::Number { value: *value },
+        Expression::String(value) => ExprExport::String {
+            value: value.clone(),
+        },
+        Expression::Boolean(value) => ExprExport::Boolean { value: *value },
+        Expression::Object(fields) => ExprExport::Object {
+            fields: fields
+                .iter()
+                .map(|(key, value)| (key.clone(), export_expr(value, interner)))
+                .collect(),
+        },
+        Expression::Array(items) => ExprExport::Array {
+            items: items
+                .iter()
+                .map(|expr| export_expr(expr, interner))
+                .collect(),
+        },
+        Expression::PropertyAccess(object, field) => ExprExport::PropertyAccess {
+            object: Box::new(export_expr(object, interner)),
+            field: sym(interner, *field),
+        },
+        Expression::Call { callee, args } => ExprExport::Call {
+            callee: Box::new(export_expr(callee, interner)),
+            args: args.iter().map(|arg| export_expr(arg, interner)).collect(),
+        },
+        Expression::BinaryOp(left, op, right) => ExprExport::BinaryOp {
+            left: Box::new(export_expr(left, interner)),
+            op: op.as_str(),
+            right: Box::new(export_expr(right, interner)),
+        },
+    }
+}
+
+fn step_var_and_deps(step: &Step, interner: &Rodeo) -> (String, Vec<String>) {
+    let mut deps = Vec::new();
+    let var = match step {
+        Step::Let { var_name, value } => {
+            collect_expr_deps(value, interner, &mut deps);
+            sym(interner, *var_name)
+        }
+        Step::FetchHttp { var_name, config } => {
+            collect_expr_deps(&config.url, interner, &mut deps);
+            sym(interner, *var_name)
+        }
+        Step::CallGrpc { var_name, config } => {
+            collect_expr_deps(&config.payload, interner, &mut deps);
+            sym(interner, *var_name)
+        }
+        Step::QueryDb { var_name, config } => {
+            collect_expr_deps(&config.db_source, interner, &mut deps);
+            for param in &config.params {
+                collect_expr_deps(param, interner, &mut deps);
+            }
+            sym(interner, *var_name)
+        }
+        Step::Pipe {
+            var_name,
+            source,
+            operations,
+        } => {
+            collect_expr_deps(source, interner, &mut deps);
+            for op in operations {
+                match op {
+                    PipeOp::Filter { param, condition } => {
+                        let bound = sym(interner, *param);
+                        collect_expr_deps(condition, interner, &mut deps);
+                        deps.retain(|dep| dep != &bound);
+                    }
+                    PipeOp::Map { param, layout } => {
+                        let bound = sym(interner, *param);
+                        for expr in layout.values() {
+                            collect_expr_deps(expr, interner, &mut deps);
+                        }
+                        deps.retain(|dep| dep != &bound);
+                    }
+                    PipeOp::Take(_) => {}
+                }
+            }
+            sym(interner, *var_name)
+        }
+    };
+    deps.sort();
+    deps.dedup();
+    (var, deps)
+}
+
+fn collect_expr_deps(expr: &Expression, interner: &Rodeo, deps: &mut Vec<String>) {
+    match expr {
+        Expression::Variable(name) => deps.push(sym(interner, *name)),
+        Expression::PropertyAccess(object, _) => collect_expr_deps(object, interner, deps),
+        Expression::Call { callee, args } => {
+            collect_expr_deps(callee, interner, deps);
+            for arg in args {
+                collect_expr_deps(arg, interner, deps);
+            }
+        }
+        Expression::BinaryOp(left, _, right) => {
+            collect_expr_deps(left, interner, deps);
+            collect_expr_deps(right, interner, deps);
+        }
+        Expression::Object(fields) => {
+            for expr in fields.values() {
+                collect_expr_deps(expr, interner, deps);
+            }
+        }
+        Expression::Array(items) => {
+            for expr in items {
+                collect_expr_deps(expr, interner, deps);
+            }
+        }
+        Expression::Number(_) | Expression::String(_) | Expression::Boolean(_) => {}
+    }
+}
+
+fn sym(interner: &Rodeo, name: Sym) -> String {
+    interner.resolve(&name).to_string()
+}
+
+fn dot_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+impl BinaryOperator {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Add => "+",
+            Self::Sub => "-",
+            Self::Mul => "*",
+            Self::Div => "/",
+            Self::Eq => "==",
+            Self::Neq => "!=",
+            Self::Gt => ">",
+            Self::Lt => "<",
+            Self::Gte => ">=",
+            Self::Lte => "<=",
+            Self::And => "&&",
+            Self::Or => "||",
+        }
+    }
+}

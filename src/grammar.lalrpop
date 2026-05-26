@@ -1,0 +1,330 @@
+use std::collections::HashMap;
+use crate::ast::*;
+use crate::lexer::Token;
+use lasso::Rodeo;
+
+grammar(interner: &mut Rodeo);
+
+pub Manifest: FileAST = {
+    <gateway:GatewayConfig> <endpoints:Endpoint*> => FileAST { gateway, endpoints }
+};
+
+GatewayConfig: GatewayConfig = {
+    "gateway" <name:String> "{" <items:GatewayItem*> "}" => {
+        let mut port = 0;
+        let mut host = None;
+        let mut static_dbs = Vec::new();
+        for item in items {
+            match item {
+                GatewayItem::Port(value) => port = value,
+                GatewayItem::Host(value) => host = Some(value),
+                GatewayItem::Databases(value) => static_dbs = value,
+            }
+        }
+        GatewayConfig { name, port, host, static_dbs }
+    }
+};
+
+GatewayItem: GatewayItem = {
+    "port" ":" <port:Int> ","? => GatewayItem::Port(port as u16),
+    "host" ":" <host:String> ","? => GatewayItem::Host(host),
+    "databases" ":" "[" <dbs:StaticDbList> "]" ","? => GatewayItem::Databases(dbs),
+};
+
+StaticDbList: Vec<StaticDb> = {
+    <mut v:(<StaticDb> ",")*> <e:StaticDb?> => {
+        if let Some(last) = e { v.push(last); }
+        v
+    }
+};
+
+StaticDb: StaticDb = {
+    <_type_ident:Ident> <name_str:String> "{" "url" ":" <url:String> ","? "}" => {
+        let name = interner.get_or_intern(&name_str);
+        StaticDb { name, url }
+    }
+};
+
+Endpoint: Endpoint = {
+    "endpoint" <path_method:String> "{" <options:EndpointOption*> <steps:Step*> "respond" <status:Int> "{" <body:ResponseObject> "}" "}" => {
+        let mut parts = path_method.split_whitespace();
+        let method = parts.next().unwrap_or("GET").to_string();
+        let path = parts.next().unwrap_or("/").to_string();
+        Endpoint {
+            method,
+            path,
+            options,
+            steps,
+            response_status: status as u16,
+            response_body: body,
+        }
+    }
+};
+
+EndpointOption: EndpointOption = {
+    "secure" ":" "[" <items:IdentList> "]" ","? => {
+        EndpointOption::Secure(items.into_iter().map(|item| interner.get_or_intern(&item)).collect())
+    },
+    "rate_limit" ":" <limit:Int> "/" <unit:Ident> "window" <window:Duration> ","? => {
+        EndpointOption::RateLimit {
+            limit: limit as u32,
+            unit: interner.get_or_intern(&unit),
+            window_ms: window,
+        }
+    },
+};
+
+IdentList: Vec<String> = {
+    <mut v:(<Ident> ",")*> <e:Ident?> => {
+        if let Some(last) = e { v.push(last); }
+        v
+    }
+};
+
+Step: Step = {
+    "fetch" <url:Expression> "as" <var:Ident> <cfg:FetchConfigBlock?> ";" => {
+        let cfg = cfg.unwrap_or_default();
+        Step::FetchHttp {
+            var_name: interner.get_or_intern(&var),
+            config: HttpConfig {
+                url,
+                timeout_ms: cfg.timeout_ms,
+                retries: cfg.retries,
+                delay_ms: cfg.delay_ms,
+                fallback: cfg.fallback,
+            }
+        }
+    },
+    "let" <var:Ident> "=" "fetch" <url:Expression> <cfg:FetchConfigBlock?> ";" => {
+        let cfg = cfg.unwrap_or_default();
+        Step::FetchHttp {
+            var_name: interner.get_or_intern(&var),
+            config: HttpConfig {
+                url,
+                timeout_ms: cfg.timeout_ms,
+                retries: cfg.retries,
+                delay_ms: cfg.delay_ms,
+                fallback: cfg.fallback,
+            }
+        }
+    },
+    "let" <var:Ident> "=" <source:Expression> <operations:PipeOp+> ";" => {
+        Step::Pipe {
+            var_name: interner.get_or_intern(&var),
+            source,
+            operations,
+        }
+    },
+    "let" <var:Ident> "=" <value:Expression> ";" => {
+        Step::Let {
+            var_name: interner.get_or_intern(&var),
+            value,
+        }
+    },
+};
+
+PipeOp: PipeOp = {
+    "|" "filter" "(" <param:Ident> "=>" <condition:Expression> ")" => {
+        PipeOp::Filter {
+            param: interner.get_or_intern(&param),
+            condition,
+        }
+    },
+    "|" "map" "(" <param:Ident> "=>" "{" <layout:ResponseObject> "}" ")" => {
+        PipeOp::Map {
+            param: interner.get_or_intern(&param),
+            layout,
+        }
+    },
+    "|" "take" "(" <count:Int> ")" => PipeOp::Take(count as usize),
+};
+
+FetchConfigBlock: TailConfig = {
+    "{" <entries:ConfigEntryList> "}" => {
+        let mut cfg = TailConfig::default();
+        for entry in entries {
+            match entry {
+                TailConfigEntry::Timeout(value) => cfg.timeout_ms = Some(value),
+                TailConfigEntry::Retry(value) => cfg.retries = Some(value),
+                TailConfigEntry::Delay(value) => cfg.delay_ms = Some(value),
+                TailConfigEntry::Fallback(value) => cfg.fallback = Some(value),
+            }
+        }
+        cfg
+    }
+};
+
+ConfigEntryList: Vec<TailConfigEntry> = {
+    <mut v:(<ConfigEntry> ",")*> <e:ConfigEntry?> => {
+        if let Some(last) = e { v.push(last); }
+        v
+    }
+};
+
+ConfigEntry: TailConfigEntry = {
+    "timeout" ":" <value:Duration> => TailConfigEntry::Timeout(value),
+    "retry" ":" <value:Int> "times" => TailConfigEntry::Retry(value as u32),
+    "delay" ":" <value:Duration> => TailConfigEntry::Delay(value),
+    "fallback" ":" <value:Expression> => TailConfigEntry::Fallback(value),
+};
+
+Duration: u64 = {
+    <value:Int> <unit:Ident> => {
+        match unit.as_str() {
+            "ms" => value as u64,
+            "s" => (value as u64) * 1_000,
+            "m" => (value as u64) * 60_000,
+            _ => value as u64,
+        }
+    }
+};
+
+ResponseObject: HashMap<String, Expression> = {
+    <mut v:(<ResponsePair> ",")*> <e:ResponsePair?> => {
+        if let Some(last) = e { v.push(last); }
+        v.into_iter().collect()
+    }
+};
+
+ResponsePair: (String, Expression) = {
+    <k:String> ":" <v:Expression> => (k, v)
+};
+
+ArrayItems: Vec<Expression> = {
+    <mut v:(<Expression> ",")*> <e:Expression?> => {
+        if let Some(last) = e { v.push(last); }
+        v
+    }
+};
+
+pub Expression: Expression = {
+    LogicalOr
+};
+
+LogicalOr: Expression = {
+    <l:LogicalOr> "||" <r:LogicalAnd> => Expression::BinaryOp(Box::new(l), BinaryOperator::Or, Box::new(r)),
+    LogicalAnd
+};
+
+LogicalAnd: Expression = {
+    <l:LogicalAnd> "&&" <r:Comparison> => Expression::BinaryOp(Box::new(l), BinaryOperator::And, Box::new(r)),
+    Comparison
+};
+
+Comparison: Expression = {
+    <l:Comparison> "==" <r:Term> => Expression::BinaryOp(Box::new(l), BinaryOperator::Eq, Box::new(r)),
+    <l:Comparison> "!=" <r:Term> => Expression::BinaryOp(Box::new(l), BinaryOperator::Neq, Box::new(r)),
+    <l:Comparison> ">" <r:Term> => Expression::BinaryOp(Box::new(l), BinaryOperator::Gt, Box::new(r)),
+    <l:Comparison> "<" <r:Term> => Expression::BinaryOp(Box::new(l), BinaryOperator::Lt, Box::new(r)),
+    <l:Comparison> ">=" <r:Term> => Expression::BinaryOp(Box::new(l), BinaryOperator::Gte, Box::new(r)),
+    <l:Comparison> "<=" <r:Term> => Expression::BinaryOp(Box::new(l), BinaryOperator::Lte, Box::new(r)),
+    Term
+};
+
+Term: Expression = {
+    <l:Term> "+" <r:Factor> => Expression::BinaryOp(Box::new(l), BinaryOperator::Add, Box::new(r)),
+    <l:Term> "-" <r:Factor> => Expression::BinaryOp(Box::new(l), BinaryOperator::Sub, Box::new(r)),
+    Factor
+};
+
+Factor: Expression = {
+    <l:Factor> "*" <r:Postfix> => Expression::BinaryOp(Box::new(l), BinaryOperator::Mul, Box::new(r)),
+    <l:Factor> "/" <r:Postfix> => Expression::BinaryOp(Box::new(l), BinaryOperator::Div, Box::new(r)),
+    Postfix
+};
+
+Postfix: Expression = {
+    <e:Postfix> "." <field:Ident> => Expression::PropertyAccess(Box::new(e), interner.get_or_intern(&field)),
+    <e:Postfix> "(" <args:CallArgs> ")" => Expression::Call { callee: Box::new(e), args },
+    Primary
+};
+
+Primary: Expression = {
+    <path:PathExpr> => path,
+    <n:Int> => Expression::Number(n as f64),
+    <f:Float> => Expression::Number(f),
+    <s:String> => Expression::String(s),
+    "true" => Expression::Boolean(true),
+    "false" => Expression::Boolean(false),
+    "{" <obj:ResponseObject> "}" => Expression::Object(obj),
+    "[" <items:ArrayItems> "]" => Expression::Array(items),
+    "(" <e:Expression> ")" => e,
+};
+
+PathExpr: Expression = {
+    <head:Ident> <tail:("::" <Ident>)*> => {
+        let mut expr = Expression::Variable(interner.get_or_intern(&head));
+        for item in tail {
+            expr = Expression::PropertyAccess(Box::new(expr), interner.get_or_intern(&item));
+        }
+        expr
+    }
+};
+
+CallArgs: Vec<Expression> = {
+    <mut v:(<Expression> ",")*> <e:Expression?> => {
+        if let Some(last) = e { v.push(last); }
+        v
+    }
+};
+
+extern {
+    type Location = usize;
+    type Error = crate::lexer::LexicalError;
+
+    enum Token {
+        "gateway" => Token::Gateway,
+        "endpoint" => Token::Endpoint,
+        "databases" => Token::Databases,
+        "port" => Token::Port,
+        "host" => Token::Host,
+        "url" => Token::Url,
+        "secure" => Token::Secure,
+        "rate_limit" => Token::RateLimit,
+        "let" => Token::Let,
+        "fetch" => Token::Fetch,
+        "as" => Token::As,
+        "respond" => Token::Respond,
+        "timeout" => Token::Timeout,
+        "retry" => Token::Retry,
+        "times" => Token::Times,
+        "delay" => Token::Delay,
+        "fallback" => Token::Fallback,
+        "filter" => Token::Filter,
+        "map" => Token::Map,
+        "take" => Token::Take,
+        "window" => Token::Window,
+        "true" => Token::True,
+        "false" => Token::False,
+        "{" => Token::BraceOpen,
+        "}" => Token::BraceClose,
+        "[" => Token::BracketOpen,
+        "]" => Token::BracketClose,
+        "(" => Token::ParenOpen,
+        ")" => Token::ParenClose,
+        ":" => Token::Colon,
+        "::" => Token::PathSep,
+        ";" => Token::Semicolon,
+        "," => Token::Comma,
+        "." => Token::Dot,
+        "=" => Token::Assign,
+        "+" => Token::Plus,
+        "-" => Token::Minus,
+        "*" => Token::Star,
+        "/" => Token::Slash,
+        "|" => Token::Pipe,
+        "=>" => Token::Arrow,
+        ">=" => Token::Gte,
+        "<=" => Token::Lte,
+        "==" => Token::Eq,
+        "!=" => Token::Neq,
+        ">" => Token::Gt,
+        "<" => Token::Lt,
+        "&&" => Token::And,
+        "||" => Token::Or,
+        Ident => Token::Ident(<String>),
+        String => Token::String(<String>),
+        Int => Token::Int(<i64>),
+        Float => Token::Float(<f64>),
+    }
+}

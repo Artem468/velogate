@@ -1,0 +1,29 @@
+[package]
+name = "velogate"
+version = "0.1.0"
+edition = "2024"
+
+[build-dependencies]
+lalrpop = "0.23.1"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+ariadne = { version = "0.6.0" }
+lasso = { version = "0.7.3", features = ["multi-threaded", "ahasher"] }
+
+logos = "0.16.1"
+lalrpop-util = { version = "0.23.1", features = ["lexer"] }
+
+petgraph = "0.8.3"
+
+tokio = { version = "1.52.3", features = ["full"] }
+axum = { version = "0.8.9", features = ["json", "macros", "matched-path"] }
+reqwest = { version = "0.13.4", features = ["json"] }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.6.11", features = ["limit", "timeout"] }
