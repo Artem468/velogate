@@ -1,0 +1,51 @@
+gateway "VeloGate-BFF" {
+    port: 8080,
+    host: "0.0.0.0"
+}
+
+endpoint "GET /api/v1/dashboard" {
+    secure: [BearerJWT],
+    rate_limit: 100/rps window 1s,
+
+    // Шаг 1 и Шаг 2 не зависят друг от друга.
+    // Rust-рантайм VeloGate запустит их одновременно (параллельно)!
+    fetch "http://users-service/me" as user {
+        timeout: 100ms,
+        fallback: { "id": 0, "role": "guest", "name": "Anonymous" }
+    };
+
+    fetch "http://weather-service/current" as weather {
+        timeout: 50ms,
+        fallback: { "temp": 20, "condition": "unknown" }
+    };
+
+    // Шаг 3 зависит от user.id.
+    // Рантайм автоматически дождется завершения Шага 1 и только потом выполнит этот запрос.
+    fetch "http://orders-service/list?user_id=" + user.id as raw_orders {
+        timeout: 500ms,
+        retry: 2 times,
+        delay: 10ms,
+        fallback: { "orders": [] }
+    };
+
+    // Шаг 4: Обработка массива данных из Шага 3
+    let top_orders = raw_orders.orders
+        | filter(order => order.status == "completed" || order.total > 500)
+        | map(order => {
+            "id": order.uuid,
+            "amount_usd": order.total / 90.0,
+            "items_count": order.items.len()
+          })
+        | take(3);
+
+    // Финальный сборщик ответа. Фронтенд получит красивый чистый JSON.
+    respond 200 {
+        "user_name": user.name,
+        "is_admin": user.role == "admin",
+        "weather": {
+            "celsius": weather.temp,
+            "status": weather.condition
+        },
+        "latest_orders": top_orders
+    }
+}
