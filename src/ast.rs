@@ -165,6 +165,18 @@ pub enum Step {
     },
 }
 
+impl Step {
+    pub fn var_name(&self) -> Sym {
+        match self {
+            Self::Let { var_name, .. }
+            | Self::FetchHttp { var_name, .. }
+            | Self::CallGrpc { var_name, .. }
+            | Self::QueryDb { var_name, .. }
+            | Self::Pipe { var_name, .. } => *var_name,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum EndpointOption {
     Secure(Vec<SecureRule>),

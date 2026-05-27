@@ -1,5 +1,5 @@
 use super::{RuntimeError, RuntimeResult, Value, Vars, eval_expr};
-use crate::ast::{FileAST, Step, Sym};
+use crate::ast::{FileAST, Sym};
 use axum::body::Bytes;
 use axum::http::{HeaderMap, header};
 use axum::routing::MethodFilter;
@@ -204,16 +204,6 @@ pub(super) fn proto_paths(ast: &FileAST, interner: &Rodeo) -> HashMap<String, St
         .iter()
         .map(|proto| (sym(interner, proto.name).to_string(), proto.path.clone()))
         .collect()
-}
-
-pub(super) fn step_var(step: &Step) -> Sym {
-    match step {
-        Step::Let { var_name, .. }
-        | Step::FetchHttp { var_name, .. }
-        | Step::CallGrpc { var_name, .. }
-        | Step::QueryDb { var_name, .. }
-        | Step::Pipe { var_name, .. } => *var_name,
-    }
 }
 
 pub(super) fn method_filter(method: &str) -> Option<MethodFilter> {

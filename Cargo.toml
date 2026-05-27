@@ -16,8 +16,6 @@ lasso = { version = "0.7.3", features = ["multi-threaded", "ahasher"] }
 logos = "0.16.1"
 lalrpop-util = { version = "0.23.1", features = ["lexer"] }
 
-petgraph = "0.8.3"
-
 tokio = { version = "1.52.3", features = ["full"] }
 axum = { version = "0.8.9", features = ["json", "macros", "matched-path"] }
 reqwest = { version = "0.13.4", features = ["json"] }

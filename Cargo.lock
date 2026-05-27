@@ -1618,7 +1618,6 @@ dependencies = [
  "fixedbitset",
  "hashbrown 0.15.5",
  "indexmap",
- "serde",
 ]
 
 [[package]]
@@ -3137,7 +3136,6 @@ dependencies = [
  "lalrpop-util",
  "lasso",
  "logos 0.16.1",
- "petgraph",
  "prost",
  "prost-reflect",
  "prost-types",

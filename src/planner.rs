@@ -1,9 +1,7 @@
 use crate::ast::*;
 use lasso::Rodeo;
-use petgraph::algo::toposort;
-use petgraph::graph::{DiGraph, NodeIndex};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ExecutionPlan {
@@ -128,7 +126,7 @@ fn build_endpoint_plan(
     let mut steps = Vec::<PlannedStep>::with_capacity(endpoint.steps.len());
 
     for (index, step) in endpoint.steps.iter().enumerate() {
-        let var = step_var(step);
+        let var = step.var_name();
         if let Some(first_step) = produced_by.insert(var, index) {
             return Err(PlanError::DuplicateVariable {
                 endpoint: endpoint_name,
@@ -208,37 +206,15 @@ fn build_endpoint_plan(
 }
 
 fn build_layers(steps: &[PlannedStep], endpoint: &Endpoint) -> Result<Vec<Vec<usize>>, PlanError> {
-    let mut graph = DiGraph::<usize, ()>::new();
-    let nodes = steps
-        .iter()
-        .map(|step| graph.add_node(step.index))
-        .collect::<Vec<NodeIndex>>();
-
-    for step in steps {
-        for dep in &step.dependencies {
-            graph.add_edge(nodes[*dep], nodes[step.index], ());
-        }
-    }
-
-    let sorted = toposort(&graph, None).map_err(|_| PlanError::Cycle {
-        endpoint: format!("{} {}", endpoint.method, endpoint.path),
-    })?;
-
-    let mut depth_by_step = BTreeMap::<usize, usize>::new();
-    for node in sorted {
-        let step_idx = graph[node];
-        let step = &steps[step_idx];
-        let depth = step
-            .dependencies
-            .iter()
-            .filter_map(|dep| depth_by_step.get(dep))
-            .max()
-            .map_or(0, |depth| depth + 1);
-        depth_by_step.insert(step_idx, depth);
-    }
-
+    let mut state = vec![VisitState::Unvisited; steps.len()];
+    let mut depths = vec![0; steps.len()];
     let mut layers = Vec::<Vec<usize>>::new();
-    for (step, depth) in depth_by_step {
+
+    for step in 0..steps.len() {
+        let depth =
+            step_depth(step, steps, &mut state, &mut depths).map_err(|_| PlanError::Cycle {
+                endpoint: format!("{} {}", endpoint.method, endpoint.path),
+            })?;
         if layers.len() <= depth {
             layers.resize_with(depth + 1, Vec::new);
         }
@@ -248,14 +224,35 @@ fn build_layers(steps: &[PlannedStep], endpoint: &Endpoint) -> Result<Vec<Vec<us
     Ok(layers)
 }
 
-fn step_var(step: &Step) -> Sym {
-    match step {
-        Step::Let { var_name, .. }
-        | Step::FetchHttp { var_name, .. }
-        | Step::CallGrpc { var_name, .. }
-        | Step::QueryDb { var_name, .. }
-        | Step::Pipe { var_name, .. } => *var_name,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VisitState {
+    Unvisited,
+    Visiting,
+    Visited,
+}
+
+fn step_depth(
+    step_idx: usize,
+    steps: &[PlannedStep],
+    state: &mut [VisitState],
+    depths: &mut [usize],
+) -> Result<usize, ()> {
+    match state[step_idx] {
+        VisitState::Visited => return Ok(depths[step_idx]),
+        VisitState::Visiting => return Err(()),
+        VisitState::Unvisited => {}
     }
+
+    state[step_idx] = VisitState::Visiting;
+    let depth = steps[step_idx]
+        .dependencies
+        .iter()
+        .try_fold(0, |depth, dep| {
+            step_depth(*dep, steps, state, depths).map(|dep_depth| depth.max(dep_depth + 1))
+        })?;
+    state[step_idx] = VisitState::Visited;
+    depths[step_idx] = depth;
+    Ok(depth)
 }
 
 fn step_kind(step: &Step) -> StepKind {

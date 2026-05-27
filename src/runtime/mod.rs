@@ -16,6 +16,7 @@ use reqwest::{Client, Method};
 use serde_json::{Map, json};
 use sqlx::any::{AnyPoolOptions, install_default_drivers};
 use sqlx::{AnyPool, Column, Row, TypeInfo};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -34,7 +35,7 @@ mod types;
 
 use functions::{
     axum_route_path, db_urls, gateway_vars, insert_value_var, method_filter, proto_paths,
-    request_body_value, request_vars, step_var, sym,
+    request_body_value, request_vars, sym,
 };
 use rate_limit::{VelogateRateLimitLayer, endpoint_rate_limit_policy};
 use security::authorize_endpoint;
@@ -186,6 +187,22 @@ impl EndpointRuntime {
 
     async fn execute(&self, mut vars: Vars) -> RuntimeResult<Value> {
         for layer in &self.plan.layers {
+            if let [step_idx] = layer.as_slice() {
+                let step = self.endpoint.steps.get(*step_idx).ok_or_else(|| {
+                    RuntimeError::Execution(format!("missing step {step_idx} in endpoint plan"))
+                })?;
+                let deps = StepRuntimeDeps {
+                    client: &self.client,
+                    db_urls: &self.db_urls,
+                    db_pools: &self.db_pools,
+                    proto_paths: &self.proto_paths,
+                    proto_pools: &self.proto_pools,
+                };
+                let value = execute_step(step, &vars, &self.interner, &deps).await?;
+                vars.insert(step.var_name(), value);
+                continue;
+            }
+
             let snapshot = Arc::new(vars.clone());
             let mut tasks = JoinSet::new();
 
@@ -203,7 +220,7 @@ impl EndpointRuntime {
                 let proto_pools = Arc::clone(&self.proto_pools);
 
                 tasks.spawn(async move {
-                    let var = step_var(&step);
+                    let var = step.var_name();
                     let deps = StepRuntimeDeps {
                         client: &client,
                         db_urls: &db_urls,
@@ -703,8 +720,8 @@ fn execute_pipe(
             PipeOp::Filter { param, condition } => {
                 let items = take_array(current, "filter")?;
                 let mut filtered = Vec::new();
+                let mut scoped = vars.clone();
                 for item in items {
-                    let mut scoped = vars.clone();
                     scoped.insert(*param, item.clone());
                     if truthy(&eval_expr(condition, &scoped, interner)?) {
                         filtered.push(item);
@@ -715,8 +732,8 @@ fn execute_pipe(
             PipeOp::Map { param, layout } => {
                 let items = take_array(current, "map")?;
                 let mut mapped = Vec::with_capacity(items.len());
+                let mut scoped = vars.clone();
                 for item in items {
-                    let mut scoped = vars.clone();
                     scoped.insert(*param, item);
                     let mut object = Map::new();
                     for (key, expr) in layout {
@@ -825,51 +842,51 @@ fn eval_builtin_call(function: &str, args: Vec<Value>) -> RuntimeResult<Value> {
         "starts_with" => {
             require_arg_count(function, &args, 2)?;
             Ok(Value::Bool(
-                as_string(args[0].clone()).starts_with(&as_string(args[1].clone())),
+                as_string_ref(&args[0]).starts_with(&*as_string_ref(&args[1])),
             ))
         }
         "ends_with" => {
             require_arg_count(function, &args, 2)?;
             Ok(Value::Bool(
-                as_string(args[0].clone()).ends_with(&as_string(args[1].clone())),
+                as_string_ref(&args[0]).ends_with(&*as_string_ref(&args[1])),
             ))
         }
         "lower" => {
             require_arg_count(function, &args, 1)?;
-            Ok(Value::String(as_string(args[0].clone()).to_lowercase()))
+            Ok(Value::String(as_string_ref(&args[0]).to_lowercase()))
         }
         "upper" => {
             require_arg_count(function, &args, 1)?;
-            Ok(Value::String(as_string(args[0].clone()).to_uppercase()))
+            Ok(Value::String(as_string_ref(&args[0]).to_uppercase()))
         }
         "trim" => {
             require_arg_count(function, &args, 1)?;
-            Ok(Value::String(as_string(args[0].clone()).trim().to_string()))
+            Ok(Value::String(as_string_ref(&args[0]).trim().to_string()))
         }
         "replace" => {
             require_arg_count(function, &args, 3)?;
-            Ok(Value::String(as_string(args[0].clone()).replace(
-                &as_string(args[1].clone()),
-                &as_string(args[2].clone()),
+            Ok(Value::String(as_string_ref(&args[0]).replace(
+                &*as_string_ref(&args[1]),
+                &as_string_ref(&args[2]),
             )))
         }
         "split" => {
             require_arg_count(function, &args, 2)?;
             Ok(Value::Array(
-                as_string(args[0].clone())
-                    .split(&as_string(args[1].clone()))
+                as_string_ref(&args[0])
+                    .split(&*as_string_ref(&args[1]))
                     .map(|item| Value::String(item.to_string()))
                     .collect(),
             ))
         }
         "join" => {
             require_arg_count(function, &args, 2)?;
-            join_array(&args[0], &as_string(args[1].clone()))
+            join_array(&args[0], &as_string_ref(&args[1]))
         }
         "format" => format_string(&args),
         "string" => {
             require_arg_count(function, &args, 1)?;
-            Ok(Value::String(as_string(args[0].clone())))
+            Ok(Value::String(as_string_ref(&args[0]).into_owned()))
         }
         "number" => {
             require_arg_count(function, &args, 1)?;
@@ -906,13 +923,13 @@ fn eval_method_call(receiver: Value, method: &str, args: Vec<Value>) -> RuntimeR
         "starts_with" => {
             require_arg_count(method, &args, 1)?;
             Ok(Value::Bool(
-                as_string(receiver).starts_with(&as_string(args[0].clone())),
+                as_string(receiver).starts_with(&*as_string_ref(&args[0])),
             ))
         }
         "ends_with" => {
             require_arg_count(method, &args, 1)?;
             Ok(Value::Bool(
-                as_string(receiver).ends_with(&as_string(args[0].clone())),
+                as_string(receiver).ends_with(&*as_string_ref(&args[0])),
             ))
         }
         "lower" => {
@@ -930,22 +947,22 @@ fn eval_method_call(receiver: Value, method: &str, args: Vec<Value>) -> RuntimeR
         "replace" => {
             require_arg_count(method, &args, 2)?;
             Ok(Value::String(as_string(receiver).replace(
-                &as_string(args[0].clone()),
-                &as_string(args[1].clone()),
+                &*as_string_ref(&args[0]),
+                &as_string_ref(&args[1]),
             )))
         }
         "split" => {
             require_arg_count(method, &args, 1)?;
             Ok(Value::Array(
                 as_string(receiver)
-                    .split(&as_string(args[0].clone()))
+                    .split(&*as_string_ref(&args[0]))
                     .map(|item| Value::String(item.to_string()))
                     .collect(),
             ))
         }
         "join" => {
             require_arg_count(method, &args, 1)?;
-            join_array(&receiver, &as_string(args[0].clone()))
+            join_array(&receiver, &as_string_ref(&args[0]))
         }
         _ => Err(RuntimeError::Execution(format!(
             "unsupported method `{method}` for {}",
@@ -1019,9 +1036,9 @@ fn value_len(value: &Value) -> RuntimeResult<Value> {
 
 fn contains_value(container: &Value, needle: &Value) -> RuntimeResult<bool> {
     match container {
-        Value::String(value) => Ok(value.contains(&as_string(needle.clone()))),
+        Value::String(value) => Ok(value.contains(&*as_string_ref(needle))),
         Value::Array(items) => Ok(items.iter().any(|item| item == needle)),
-        Value::Object(object) => Ok(object.contains_key(&as_string(needle.clone()))),
+        Value::Object(object) => Ok(object.contains_key(&*as_string_ref(needle))),
         other => Err(RuntimeError::Execution(format!(
             "contains() is not supported for {}",
             value_type(other)
@@ -1055,7 +1072,7 @@ fn format_string(args: &[Value]) -> RuntimeResult<Value> {
 
     let mut output = as_string(args[0].clone());
     for value in &args[1..] {
-        let replacement = as_string(value.clone());
+        let replacement = as_string_ref(value);
         if output.contains("{}") {
             output = output.replacen("{}", &replacement, 1);
         } else {
@@ -1124,6 +1141,16 @@ fn as_string(value: Value) -> String {
         Value::Bool(value) => value.to_string(),
         Value::Null => "null".to_string(),
         other => other.to_string(),
+    }
+}
+
+fn as_string_ref(value: &Value) -> Cow<'_, str> {
+    match value {
+        Value::String(value) => Cow::Borrowed(value),
+        Value::Number(value) => Cow::Owned(value.to_string()),
+        Value::Bool(value) => Cow::Owned(value.to_string()),
+        Value::Null => Cow::Borrowed("null"),
+        other => Cow::Owned(other.to_string()),
     }
 }
 
