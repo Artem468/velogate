@@ -13,25 +13,55 @@ GatewayConfig: GatewayConfig = {
     "gateway" <name:String> "{" <items:GatewayItem*> "}" => {
         let mut port = 0;
         let mut host = None;
+        let mut env_file = None;
+        let mut constants = Vec::new();
         let mut static_dbs = Vec::new();
         let mut static_protos = Vec::new();
         for item in items {
             match item {
                 GatewayItem::Port(value) => port = value,
                 GatewayItem::Host(value) => host = Some(value),
+                GatewayItem::EnvFile(value) => env_file = Some(value),
+                GatewayItem::Constants(value) => constants = value,
                 GatewayItem::Databases(value) => static_dbs = value,
                 GatewayItem::Protos(value) => static_protos = value,
             }
         }
-        GatewayConfig { name, port, host, static_dbs, static_protos }
+        GatewayConfig { name, port, host, env_file, constants, static_dbs, static_protos }
     }
 };
 
 GatewayItem: GatewayItem = {
     "port" ":" <port:Int> ","? => GatewayItem::Port(port as u16),
     "host" ":" <host:String> ","? => GatewayItem::Host(host),
+    <key:Ident> ":" <path:String> ","? => {
+        match key.as_str() {
+            "env_file" => GatewayItem::EnvFile(path),
+            _ => GatewayItem::EnvFile(path),
+        }
+    },
+    <key:Ident> ":" "{" <constants:GatewayConstantList> "}" ","? => {
+        match key.as_str() {
+            "constants" => GatewayItem::Constants(constants),
+            _ => GatewayItem::Constants(constants),
+        }
+    },
     "databases" ":" "[" <dbs:StaticDbList> "]" ","? => GatewayItem::Databases(dbs),
     "protos" ":" "[" <protos:StaticProtoList> "]" ","? => GatewayItem::Protos(protos),
+};
+
+GatewayConstantList: Vec<GatewayConstant> = {
+    <mut v:(<GatewayConstant> ",")*> <e:GatewayConstant?> => {
+        if let Some(last) = e { v.push(last); }
+        v
+    }
+};
+
+GatewayConstant: GatewayConstant = {
+    <name:String> ":" <value:Expression> => GatewayConstant {
+        name: interner.get_or_intern(&name),
+        value,
+    }
 };
 
 StaticDbList: Vec<StaticDb> = {
@@ -85,14 +115,73 @@ EndpointResponse: (u16, HashMap<String, Expression>) = {
 };
 
 EndpointOption: EndpointOption = {
-    "secure" ":" "[" <items:IdentList> "]" ","? => {
-        EndpointOption::Secure(items.into_iter().map(|item| interner.get_or_intern(&item)).collect())
+    "secure" ":" "[" <items:SecureRuleList> "]" ","? => {
+        EndpointOption::Secure(items)
     },
     "rate_limit" ":" <limit:Int> "/" <unit:Ident> "window" <window:Duration> ","? => {
         EndpointOption::RateLimit {
             limit: limit as u32,
             unit: interner.get_or_intern(&unit),
             window_ms: window,
+        }
+    },
+};
+
+SecureRuleList: Vec<SecureRule> = {
+    <mut v:(<SecureRule> ",")*> <e:SecureRule?> => {
+        if let Some(last) = e { v.push(last); }
+        v
+    }
+};
+
+SecureRule: SecureRule = {
+    <scheme:Ident> => SecureRule {
+        scheme: interner.get_or_intern(&scheme),
+        secret: None,
+        username: None,
+        password: None,
+        checks: Vec::new(),
+    },
+    <scheme:Ident> "{" <cfg:SecureRuleConfigEntries> "}" => SecureRule {
+        scheme: interner.get_or_intern(&scheme),
+        secret: cfg.secret,
+        username: cfg.username,
+        password: cfg.password,
+        checks: cfg.checks,
+    },
+};
+
+SecureRuleConfigEntries: SecureRuleConfig = {
+    <entries:SecureRuleConfigEntryList> => {
+        let mut cfg = SecureRuleConfig::default();
+        for entry in entries {
+            match entry {
+                SecureRuleConfigEntry::Secret(value) => cfg.secret = Some(value),
+                SecureRuleConfigEntry::Username(value) => cfg.username = Some(value),
+                SecureRuleConfigEntry::Password(value) => cfg.password = Some(value),
+                SecureRuleConfigEntry::Checks(value) => cfg.checks = value,
+            }
+        }
+        cfg
+    }
+};
+
+SecureRuleConfigEntryList: Vec<SecureRuleConfigEntry> = {
+    <mut v:(<SecureRuleConfigEntry> ",")*> <e:SecureRuleConfigEntry?> => {
+        if let Some(last) = e { v.push(last); }
+        v
+    }
+};
+
+SecureRuleConfigEntry: SecureRuleConfigEntry = {
+    <key:Ident> ":" <value:Expression> => {
+        match (key.as_str(), value) {
+            ("checks", Expression::Array(items)) => SecureRuleConfigEntry::Checks(items),
+            ("checks", value) => SecureRuleConfigEntry::Checks(vec![value]),
+            ("secret", value) => SecureRuleConfigEntry::Secret(value),
+            ("username", value) => SecureRuleConfigEntry::Username(value),
+            ("password", value) => SecureRuleConfigEntry::Password(value),
+            (_, value) => SecureRuleConfigEntry::Secret(value),
         }
     },
 };
@@ -322,6 +411,7 @@ Postfix: Expression = {
 Primary: Expression = {
     <path:PathExpr> => path,
     "query" => Expression::Variable(interner.get_or_intern("query")),
+    "env" => Expression::Variable(interner.get_or_intern("env")),
     <n:Int> => Expression::Number(n as f64),
     <f:Float> => Expression::Number(f),
     <s:String> => Expression::String(s),
@@ -369,6 +459,7 @@ extern {
         "fetch" => Token::Fetch,
         "db" => Token::Db,
         "query" => Token::Query,
+        "env" => Token::Env,
         "grpc" => Token::Grpc,
         "call" => Token::Call,
         "as" => Token::As,

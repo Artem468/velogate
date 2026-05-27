@@ -1,15 +1,17 @@
 use crate::ast::{
     BinaryOperator, DbQueryConfig, Endpoint, EndpointOption, Expression, FileAST, GrpcConfig,
-    HttpConfig, PipeOp, Step, Sym,
+    HttpConfig, PipeOp, SecureRule, Step, Sym,
 };
 use crate::planner::{EndpointPlan, ExecutionPlan};
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query};
 use axum::http::{HeaderMap, Request, StatusCode, header};
-use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodFilter, on};
 use axum::{Json, Router};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use lasso::Rodeo;
 use prost::Message;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
@@ -62,11 +64,6 @@ type Vars = HashMap<Sym, JsonValue>;
 type Value = JsonValue;
 type RuntimeResult<T> = Result<T, RuntimeError>;
 static SQLX_DRIVERS: Once = Once::new();
-
-#[derive(Clone)]
-struct SecurePolicy {
-    schemes: Vec<String>,
-}
 
 #[derive(Clone)]
 struct RateLimitPolicy {
@@ -122,6 +119,7 @@ impl Runtime {
 
     pub fn router(&self) -> RuntimeResult<Router> {
         let mut router = Router::new();
+        let static_vars = gateway_vars(&self.ast, &self.interner)?;
 
         for (idx, endpoint) in self.ast.endpoints.iter().enumerate() {
             let plan = self
@@ -135,7 +133,7 @@ impl Runtime {
                 plan,
                 interner: Arc::clone(&self.interner),
                 client: self.client.clone(),
-                static_dbs: static_dbs(&self.ast),
+                static_vars: static_vars.clone(),
                 db_urls: Arc::clone(&self.db_urls),
                 db_pools: Arc::clone(&self.db_pools),
                 proto_paths: Arc::clone(&self.proto_paths),
@@ -156,7 +154,12 @@ impl Runtime {
                     let runtime = Arc::clone(&handler_runtime);
                     async move {
                         runtime
-                            .handle(path_params, query_params, headers, request_body_value(&body))
+                            .handle(
+                                path_params,
+                                query_params,
+                                headers,
+                                request_body_value(&body),
+                            )
                             .await
                     }
                 },
@@ -166,41 +169,11 @@ impl Runtime {
                 method_router = method_router.layer(VelogateRateLimitLayer::new(policy));
             }
 
-            if let Some(policy) = endpoint_secure_policy(endpoint, &self.interner) {
-                method_router =
-                    method_router.layer(middleware::from_fn_with_state(policy, secure_middleware));
-            }
-
             router = router.route(&axum_route_path(&endpoint.path), method_router);
         }
 
         Ok(router)
     }
-}
-
-async fn secure_middleware(
-    State(policy): State<SecurePolicy>,
-    request: Request<Body>,
-    next: Next,
-) -> Response {
-    if policy.schemes.iter().any(|scheme| scheme == "BearerJWT") {
-        let authorized = request
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .is_some_and(|token| !token.trim().is_empty());
-
-        if !authorized {
-            let body = json!({
-                "error": "unauthorized",
-                "message": "missing or invalid bearer token",
-            });
-            return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
-        }
-    }
-
-    next.run(request).await
 }
 
 #[derive(Clone)]
@@ -280,12 +253,174 @@ async fn rate_limited(policy: &RateLimitPolicy) -> bool {
     }
 }
 
+fn authorize_endpoint(
+    endpoint: &Endpoint,
+    vars: &mut Vars,
+    headers: &HeaderMap,
+    interner: &Rodeo,
+) -> Result<(), SecureFailure> {
+    for option in &endpoint.options {
+        let EndpointOption::Secure(rules) = option else {
+            continue;
+        };
+
+        for rule in rules {
+            authorize_rule(rule, vars, headers, interner)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn authorize_rule(
+    rule: &SecureRule,
+    vars: &mut Vars,
+    headers: &HeaderMap,
+    interner: &Rodeo,
+) -> Result<(), SecureFailure> {
+    let scheme = sym(interner, rule.scheme);
+    match scheme {
+        "JWT" => {
+            let secret = eval_secure_string(rule.secret.as_ref(), vars, interner, "secret")?;
+            let token = bearer_token(headers).ok_or_else(|| SecureFailure {
+                message: "missing or invalid bearer token".to_string(),
+            })?;
+            let claims = decode_jwt_claims(token, &secret)?;
+            insert_value_var(vars, interner, "jwt", claims);
+            for check in &rule.checks {
+                let passed = eval_expr(check, vars, interner)
+                    .map(|value| truthy(&value))
+                    .map_err(|err| SecureFailure {
+                        message: format!("secure check failed to evaluate: {err}"),
+                    })?;
+                if !passed {
+                    return Err(SecureFailure {
+                        message: "secure check rejected request".to_string(),
+                    });
+                }
+            }
+        }
+        "Basic" => {
+            let (username, password) = basic_credentials(headers).ok_or_else(|| SecureFailure {
+                message: "missing or invalid basic authorization".to_string(),
+            })?;
+            if let Some(expected) = eval_optional_secure_string(&rule.username, vars, interner)?
+                && username.as_str() != expected.as_str()
+            {
+                return Err(SecureFailure {
+                    message: "basic username rejected".to_string(),
+                });
+            }
+            if let Some(expected) = eval_optional_secure_string(&rule.password, vars, interner)?
+                && password.as_str() != expected.as_str()
+            {
+                return Err(SecureFailure {
+                    message: "basic password rejected".to_string(),
+                });
+            }
+            insert_value_var(
+                vars,
+                interner,
+                "basic",
+                json!({ "username": username, "password": password }),
+            );
+            for check in &rule.checks {
+                let passed = eval_expr(check, vars, interner)
+                    .map(|value| truthy(&value))
+                    .map_err(|err| SecureFailure {
+                        message: format!("secure check failed to evaluate: {err}"),
+                    })?;
+                if !passed {
+                    return Err(SecureFailure {
+                        message: "secure check rejected request".to_string(),
+                    });
+                }
+            }
+        }
+        _ => {
+            return Err(SecureFailure {
+                message: format!("unsupported secure scheme `{scheme}`"),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
+    let encoded = headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Basic ")?
+        .trim();
+    let decoded = BASE64.decode(encoded).ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let (username, password) = decoded.split_once(':')?;
+    Some((username.to_string(), password.to_string()))
+}
+
+fn eval_secure_string(
+    expr: Option<&Expression>,
+    vars: &Vars,
+    interner: &Rodeo,
+    field: &str,
+) -> Result<String, SecureFailure> {
+    let expr = expr.ok_or_else(|| SecureFailure {
+        message: format!("secure rule requires `{field}`"),
+    })?;
+    eval_expr(expr, vars, interner)
+        .map(as_string)
+        .map_err(|err| SecureFailure {
+            message: format!("secure `{field}` failed to evaluate: {err}"),
+        })
+}
+
+fn eval_optional_secure_string(
+    expr: &Option<Expression>,
+    vars: &Vars,
+    interner: &Rodeo,
+) -> Result<Option<String>, SecureFailure> {
+    expr.as_ref()
+        .map(|expr| {
+            eval_expr(expr, vars, interner)
+                .map(as_string)
+                .map_err(|err| SecureFailure {
+                    message: format!("secure credential failed to evaluate: {err}"),
+                })
+        })
+        .transpose()
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+}
+
+fn decode_jwt_claims(token: &str, secret: &str) -> Result<Value, SecureFailure> {
+    let validation = Validation::new(Algorithm::HS256);
+    decode::<Value>(
+        token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &validation,
+    )
+    .map(|data| data.claims)
+    .map_err(|err| SecureFailure {
+        message: format!("invalid JWT: {err}"),
+    })
+}
+
 struct EndpointRuntime {
     endpoint: Endpoint,
     plan: EndpointPlan,
     interner: Arc<Rodeo>,
     client: Client,
-    static_dbs: Vars,
+    static_vars: Vars,
     db_urls: Arc<HashMap<String, String>>,
     db_pools: Arc<Mutex<HashMap<String, AnyPool>>>,
     proto_paths: Arc<HashMap<String, String>>,
@@ -300,6 +435,10 @@ struct StepRuntimeDeps<'a> {
     proto_pools: &'a Mutex<HashMap<String, DescriptorPool>>,
 }
 
+struct SecureFailure {
+    message: String,
+}
+
 impl EndpointRuntime {
     async fn handle(
         self: Arc<Self>,
@@ -308,7 +447,24 @@ impl EndpointRuntime {
         headers: HeaderMap,
         body: Value,
     ) -> Response {
-        match self.execute(path_params, query_params, &headers, body).await {
+        let mut vars = self.static_vars.clone();
+        vars.extend(request_vars(
+            &path_params,
+            &query_params,
+            &headers,
+            body,
+            &self.interner,
+        ));
+
+        if let Err(err) = authorize_endpoint(&self.endpoint, &mut vars, &headers, &self.interner) {
+            let body = json!({
+                "error": "unauthorized",
+                "message": err.message,
+            });
+            return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
+        }
+
+        match self.execute(vars).await {
             Ok(value) => {
                 let status =
                     StatusCode::from_u16(self.endpoint.response_status).unwrap_or(StatusCode::OK);
@@ -324,22 +480,7 @@ impl EndpointRuntime {
         }
     }
 
-    async fn execute(
-        &self,
-        path_params: HashMap<String, String>,
-        query_params: HashMap<String, String>,
-        headers: &HeaderMap,
-        body: Value,
-    ) -> RuntimeResult<Value> {
-        let mut vars = self.static_dbs.clone();
-        vars.extend(request_vars(
-            &path_params,
-            &query_params,
-            headers,
-            body,
-            &self.interner,
-        ));
-
+    async fn execute(&self, mut vars: Vars) -> RuntimeResult<Value> {
         for layer in &self.plan.layers {
             let snapshot = Arc::new(vars.clone());
             let mut tasks = JoinSet::new();
@@ -412,7 +553,9 @@ async fn fetch_http(
     let url = as_string(eval_expr(&config.url, vars, interner)?);
     let method_name = config.method.as_deref().unwrap_or("GET").to_uppercase();
     let method = Method::from_bytes(method_name.as_bytes()).map_err(|err| {
-        RuntimeError::Execution(format!("invalid HTTP method `{method_name}` for fetch: {err}"))
+        RuntimeError::Execution(format!(
+            "invalid HTTP method `{method_name}` for fetch: {err}"
+        ))
     })?;
     let request_body = config
         .body
@@ -1141,12 +1284,75 @@ fn value_type(value: &Value) -> &'static str {
     }
 }
 
-fn static_dbs(ast: &FileAST) -> Vars {
-    ast.gateway
+fn gateway_vars(ast: &FileAST, interner: &Rodeo) -> RuntimeResult<Vars> {
+    let mut vars: Vars = ast
+        .gateway
         .static_dbs
         .iter()
         .map(|db| (db.name, Value::String(db.url.clone())))
+        .collect();
+
+    insert_value_var(
+        &mut vars,
+        interner,
+        "env",
+        Value::Object(load_env_file(ast.gateway.env_file.as_deref())?),
+    );
+
+    for constant in &ast.gateway.constants {
+        let value = eval_expr(&constant.value, &vars, interner).map_err(|err| {
+            RuntimeError::Execution(format!(
+                "failed to evaluate gateway constant `{}`: {err}",
+                sym(interner, constant.name)
+            ))
+        })?;
+        vars.insert(constant.name, value);
+    }
+
+    Ok(vars)
+}
+
+fn load_env_file(path: Option<&str>) -> RuntimeResult<Map<String, Value>> {
+    let Some(path) = path else {
+        return Ok(Map::new());
+    };
+    let contents = std::fs::read_to_string(path).map_err(|err| {
+        RuntimeError::Execution(format!("failed to read env_file `{path}`: {err}"))
+    })?;
+    Ok(parse_env_file(&contents))
+}
+
+fn parse_env_file(contents: &str) -> Map<String, Value> {
+    contents
+        .lines()
+        .filter_map(parse_env_line)
+        .map(|(key, value)| (normalize_key(&key), Value::String(value)))
         .collect()
+}
+
+fn parse_env_line(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let line = line.strip_prefix("export ").unwrap_or(line);
+    let (key, value) = line.split_once('=')?;
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    Some((key.to_string(), unquote_env_value(value.trim())))
+}
+
+fn unquote_env_value(value: &str) -> String {
+    if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        value[1..value.len() - 1].to_string()
+    } else {
+        value.to_string()
+    }
 }
 
 fn request_vars(
@@ -1219,6 +1425,12 @@ fn insert_string_var(vars: &mut Vars, interner: &Rodeo, name: &str, value: Strin
 fn insert_object_var(vars: &mut Vars, interner: &Rodeo, name: &str, value: Map<String, Value>) {
     if let Some(sym) = interner.get(name) {
         vars.insert(sym, Value::Object(value));
+    }
+}
+
+fn insert_value_var(vars: &mut Vars, interner: &Rodeo, name: &str, value: Value) {
+    if let Some(sym) = interner.get(name) {
+        vars.insert(sym, value);
     }
 }
 
@@ -1297,18 +1509,6 @@ fn endpoint_rate_limit_policy(endpoint: &Endpoint) -> Option<RateLimitPolicy> {
     })
 }
 
-fn endpoint_secure_policy(endpoint: &Endpoint, interner: &Rodeo) -> Option<SecurePolicy> {
-    endpoint.options.iter().find_map(|option| match option {
-        EndpointOption::Secure(schemes) => Some(SecurePolicy {
-            schemes: schemes
-                .iter()
-                .map(|scheme| sym(interner, *scheme).to_string())
-                .collect(),
-        }),
-        EndpointOption::RateLimit { .. } => None,
-    })
-}
-
 fn method_filter(method: &str) -> Option<MethodFilter> {
     match method {
         "GET" => Some(MethodFilter::GET),
@@ -1345,13 +1545,16 @@ impl std::error::Error for RuntimeError {}
 
 #[cfg(test)]
 mod tests {
-    use super::Runtime;
+    use super::{BASE64, Runtime};
     use crate::parser::Parser;
     use crate::planner::build_plan;
     use axum::body::to_bytes;
     use axum::http::{Request, StatusCode};
+    use base64::Engine;
+    use jsonwebtoken::{EncodingKey, Header, encode};
     use lasso::Rodeo;
     use serde_json::{Value, json};
+    use std::fs;
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -1480,13 +1683,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn secure_endpoint_requires_bearer_token() {
+    async fn basic_secure_rule_verifies_credentials_and_custom_checks() {
         let source = r#"
             gateway "test" { port: 0 }
 
             endpoint "GET /secure" {
-                secure: [BearerJWT],
-                respond 200 { "ok": true }
+                secure: [
+                    Basic {
+                        username: "admin",
+                        password: "secret",
+                        checks: [
+                            basic.username == "admin"
+                        ]
+                    }
+                ],
+                respond 200 { "user": basic.username }
             }
         "#;
 
@@ -1505,16 +1716,156 @@ mod tests {
         assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 
         let authorized = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/secure")
-                    .header("authorization", "Bearer token")
+                    .header("authorization", basic_auth("admin", "secret"))
                     .body(axum::body::Body::empty())
                     .expect("request should build"),
             )
             .await
             .expect("route should respond");
         assert_eq!(authorized.status(), StatusCode::OK);
+
+        let rejected = router
+            .oneshot(
+                Request::builder()
+                    .uri("/secure")
+                    .header("authorization", basic_auth("admin", "bad"))
+                    .body(axum::body::Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn jwt_secure_rule_verifies_token_and_custom_checks() {
+        let source = r#"
+            gateway "test" { port: 0 }
+
+            endpoint "GET /secure/:id" {
+                secure: [
+                    JWT {
+                        secret: "test-secret",
+                        checks: [
+                            jwt.role == "admin",
+                            jwt.sub == id
+                        ]
+                    }
+                ],
+
+                respond 200 {
+                    "sub": jwt.sub,
+                    "role": jwt.role
+                }
+            }
+        "#;
+
+        let router = test_router(source);
+        let token = test_jwt(json!({
+            "sub": "42",
+            "role": "admin",
+            "exp": 4102444800u64
+        }));
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/secure/42")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body should read");
+        let actual: Value = serde_json::from_slice(&body).expect("body should be JSON");
+        assert_eq!(actual, json!({ "sub": "42", "role": "admin" }));
+
+        let forbidden_token = test_jwt(json!({
+            "sub": "42",
+            "role": "user",
+            "exp": 4102444800u64
+        }));
+        let forbidden = router
+            .oneshot(
+                Request::builder()
+                    .uri("/secure/42")
+                    .header("authorization", format!("Bearer {forbidden_token}"))
+                    .body(axum::body::Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(forbidden.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn gateway_env_file_and_constants_are_available_to_endpoints() {
+        let env_path = std::env::temp_dir().join(format!(
+            "velogate-test-{}-constants.env",
+            std::process::id()
+        ));
+        fs::write(&env_path, "API_BASE=https://example.test\nTOKEN=abc\n")
+            .expect("env file should write");
+        let env_path = env_path.to_string_lossy().replace('\\', "/");
+        let source = format!(
+            r#"
+            gateway "test" {{
+                port: 0,
+                env_file: "{env_path}",
+                constants: {{
+                    "api_base": env.API_BASE,
+                    "limit": 25
+                }}
+            }}
+
+            endpoint "GET /constants" {{
+                respond 200 {{
+                    "api_base": api_base,
+                    "limit": limit,
+                    "token": env.TOKEN
+                }}
+            }}
+        "#
+        );
+
+        let router = test_router(&source);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/constants")
+                    .body(axum::body::Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body should read");
+        let actual: Value = serde_json::from_slice(&body).expect("body should be JSON");
+        assert_eq!(
+            actual,
+            json!({
+                "api_base": "https://example.test",
+                "limit": 25.0,
+                "token": "abc"
+            })
+        );
+
+        let _ = fs::remove_file(env_path);
     }
 
     #[tokio::test]
@@ -1701,5 +2052,21 @@ mod tests {
         Runtime::new(ast, parser.interner, plan)
             .router()
             .expect("router should build")
+    }
+
+    fn test_jwt(claims: Value) -> String {
+        encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(b"test-secret"),
+        )
+        .expect("test JWT should encode")
+    }
+
+    fn basic_auth(username: &str, password: &str) -> String {
+        format!(
+            "Basic {}",
+            BASE64.encode(format!("{username}:{password}").as_bytes())
+        )
     }
 }

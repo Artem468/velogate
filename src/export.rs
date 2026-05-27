@@ -14,6 +14,8 @@ pub struct GatewayExport {
     pub name: String,
     pub port: u16,
     pub host: Option<String>,
+    pub env_file: Option<String>,
+    pub constants: BTreeMap<String, ExprExport>,
     pub static_dbs: Vec<StaticDbExport>,
     pub static_protos: Vec<StaticProtoExport>,
 }
@@ -44,13 +46,22 @@ pub struct EndpointExport {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EndpointOptionExport {
     Secure {
-        schemes: Vec<String>,
+        rules: Vec<SecureRuleExport>,
     },
     RateLimit {
         limit: u32,
         unit: String,
         window_ms: u64,
     },
+}
+
+#[derive(Debug, Serialize)]
+pub struct SecureRuleExport {
+    pub scheme: String,
+    pub has_secret: bool,
+    pub has_username: bool,
+    pub has_password: bool,
+    pub checks: Vec<ExprExport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,6 +93,8 @@ pub enum StepExport {
 #[derive(Debug, Serialize)]
 pub struct HttpConfigExport {
     pub url: ExprExport,
+    pub method: Option<String>,
+    pub body: Option<ExprExport>,
     pub timeout_ms: Option<u64>,
     pub retries: Option<u32>,
     pub delay_ms: Option<u64>,
@@ -166,6 +179,18 @@ pub fn export_file(ast: &FileAST, interner: &Rodeo) -> FileExport {
             name: ast.gateway.name.clone(),
             port: ast.gateway.port,
             host: ast.gateway.host.clone(),
+            env_file: ast.gateway.env_file.clone(),
+            constants: ast
+                .gateway
+                .constants
+                .iter()
+                .map(|constant| {
+                    (
+                        sym(interner, constant.name),
+                        export_expr(&constant.value, interner),
+                    )
+                })
+                .collect(),
             static_dbs: ast
                 .gateway
                 .static_dbs
@@ -259,6 +284,8 @@ fn export_step(step: &Step, interner: &Rodeo) -> StepExport {
             var_name: sym(interner, *var_name),
             config: HttpConfigExport {
                 url: export_expr(&config.url, interner),
+                method: config.method.clone(),
+                body: config.body.as_ref().map(|expr| export_expr(expr, interner)),
                 timeout_ms: config.timeout_ms,
                 retries: config.retries,
                 delay_ms: config.delay_ms,
@@ -317,8 +344,21 @@ fn export_step(step: &Step, interner: &Rodeo) -> StepExport {
 
 fn export_endpoint_option(option: &EndpointOption, interner: &Rodeo) -> EndpointOptionExport {
     match option {
-        EndpointOption::Secure(items) => EndpointOptionExport::Secure {
-            schemes: items.iter().map(|item| sym(interner, *item)).collect(),
+        EndpointOption::Secure(rules) => EndpointOptionExport::Secure {
+            rules: rules
+                .iter()
+                .map(|rule| SecureRuleExport {
+                    scheme: sym(interner, rule.scheme),
+                    has_secret: rule.secret.is_some(),
+                    has_username: rule.username.is_some(),
+                    has_password: rule.password.is_some(),
+                    checks: rule
+                        .checks
+                        .iter()
+                        .map(|expr| export_expr(expr, interner))
+                        .collect(),
+                })
+                .collect(),
         },
         EndpointOption::RateLimit {
             limit,
@@ -396,6 +436,9 @@ fn step_var_and_deps(step: &Step, interner: &Rodeo) -> (String, Vec<String>) {
         }
         Step::FetchHttp { var_name, config } => {
             collect_expr_deps(&config.url, interner, &mut deps);
+            if let Some(body) = &config.body {
+                collect_expr_deps(body, interner, &mut deps);
+            }
             sym(interner, *var_name)
         }
         Step::CallGrpc { var_name, config } => {

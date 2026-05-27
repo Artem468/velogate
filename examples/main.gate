@@ -1,12 +1,18 @@
 gateway "VeloGate-BFF" {
     port: 8080,
-    host: "0.0.0.0"
+    host: "0.0.0.0",
+    env_file: ".env",
+    constants: {
+        "todos_api": env.TODOS_API,
+        "default_take": 100,
+        "service_name": "todos-bff"
+    }
 }
 
 endpoint "GET /api/v1/todos" {
     rate_limit: 100/rps window 1s,
 
-    fetch "https://jsonplaceholder.typicode.com/todos" as raw_todos {
+    fetch todos_api + "/todos" as raw_todos {
         timeout: 500ms,
         retry: 2 times,
         delay: 10ms,
@@ -23,12 +29,14 @@ endpoint "GET /api/v1/todos" {
         | take(100);
 
     respond 200 {
+        "service": service_name,
+        "default_take": default_take,
         "data": completed_todos
     }
 }
 
 endpoint "GET /api/v1/todos/:id" {
-    fetch "https://jsonplaceholder.typicode.com/todos/" + id as td {
+    fetch todos_api + "/todos/" + id as td {
         method: "GET",
         timeout: 500ms,
         retry: 2 times,
@@ -47,8 +55,43 @@ endpoint "GET /api/v1/todos/:id" {
     }
 }
 
+endpoint "GET /api/v1/me/:id" {
+    secure: [
+        JWT {
+            secret: "dev-secret",
+            checks: [
+                jwt.sub == id,
+                jwt.role == "admin" || jwt.role == "user"
+            ]
+        }
+    ],
+
+    respond 200 {
+        "user_id": jwt.sub,
+        "role": jwt.role,
+        "token": jwt
+    }
+}
+
+endpoint "GET /api/v1/admin" {
+    secure: [
+        Basic {
+            username: "admin",
+            password: env.ADMIN_PASSWORD,
+            checks: [
+                basic.username == "admin"
+            ]
+        }
+    ],
+
+    respond 200 {
+        "ok": true,
+        "user": basic.username
+    }
+}
+
 endpoint "POST /api/v1/todos" {
-    fetch "https://jsonplaceholder.typicode.com/todos" as created_todo {
+    fetch todos_api + "/todos" as created_todo {
         method: "POST",
         body: {
             "title": body.title,
@@ -73,7 +116,7 @@ endpoint "POST /api/v1/todos" {
 }
 
 endpoint "PATCH /api/v1/todos/:id" {
-    fetch "https://jsonplaceholder.typicode.com/todos/" + id as updated_todo {
+    fetch todos_api + "/todos/" + id as updated_todo {
         method: "PATCH",
         body: {
             "title": body.title,

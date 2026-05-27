@@ -9,8 +9,16 @@ pub struct GatewayConfig {
     pub name: String,
     pub port: u16,
     pub host: Option<String>,
+    pub env_file: Option<String>,
+    pub constants: Vec<GatewayConstant>,
     pub static_dbs: Vec<StaticDb>,
     pub static_protos: Vec<StaticProto>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GatewayConstant {
+    pub name: Sym,
+    pub value: Expression,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +101,8 @@ pub(crate) enum TailConfigEntry {
 pub(crate) enum GatewayItem {
     Port(u16),
     Host(String),
+    EnvFile(String),
+    Constants(Vec<GatewayConstant>),
     Databases(Vec<StaticDb>),
     Protos(Vec<StaticProto>),
 }
@@ -157,12 +167,37 @@ pub enum Step {
 
 #[derive(Debug, Clone)]
 pub enum EndpointOption {
-    Secure(Vec<Sym>),
+    Secure(Vec<SecureRule>),
     RateLimit {
         limit: u32,
         unit: Sym,
         window_ms: u64,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct SecureRule {
+    pub scheme: Sym,
+    pub secret: Option<Expression>,
+    pub username: Option<Expression>,
+    pub password: Option<Expression>,
+    pub checks: Vec<Expression>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SecureRuleConfig {
+    pub secret: Option<Expression>,
+    pub username: Option<Expression>,
+    pub password: Option<Expression>,
+    pub checks: Vec<Expression>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum SecureRuleConfigEntry {
+    Secret(Expression),
+    Username(Expression),
+    Password(Expression),
+    Checks(Vec<Expression>),
 }
 
 #[derive(Debug, Clone)]

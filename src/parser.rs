@@ -88,7 +88,7 @@ fn normalize_span(span: Range<usize>, source_len: usize) -> Range<usize> {
 #[cfg(test)]
 mod tests {
     use super::Parser;
-    use crate::ast::{Expression, Step};
+    use crate::ast::{EndpointOption, Expression, Step};
     use lasso::Rodeo;
 
     #[test]
@@ -179,6 +179,80 @@ mod tests {
         assert_eq!(config.method.as_deref(), Some("PATCH"));
         assert!(config.body.is_some());
         assert_eq!(config.timeout_ms, Some(100));
+    }
+
+    #[test]
+    fn parses_jwt_secure_rule_with_custom_checks() {
+        let source = r#"
+            gateway "api" { port: 8080 }
+
+            endpoint "GET /v1/users/:id" {
+                secure: [
+                    JWT {
+                        secret: "dev-secret",
+                        checks: [
+                            jwt.role == "admin",
+                            jwt.sub == id
+                        ]
+                    }
+                ],
+
+                respond 200 { "sub": jwt.sub }
+            }
+        "#;
+
+        let mut parser = Parser::new(Rodeo::new());
+        let ast = parser.parse(source).expect("valid DSL should parse");
+
+        let EndpointOption::Secure(rules) = &ast.endpoints[0].options[0] else {
+            panic!("option should be secure");
+        };
+        assert_eq!(rules.len(), 1);
+        assert!(rules[0].secret.is_some());
+        assert_eq!(rules[0].checks.len(), 2);
+    }
+
+    #[test]
+    fn parses_gateway_env_file_constants_and_basic_secure_rule() {
+        let source = r#"
+            gateway "api" {
+                port: 8080,
+                env_file: ".env",
+                constants: {
+                    "api_base": env.API_BASE,
+                    "default_limit": 10
+                }
+            }
+
+            endpoint "GET /v1/admin" {
+                secure: [
+                    Basic {
+                        username: "admin",
+                        password: "secret",
+                        checks: [
+                            basic.username == "admin"
+                        ]
+                    }
+                ],
+
+                respond 200 {
+                    "url": api_base,
+                    "limit": default_limit
+                }
+            }
+        "#;
+
+        let mut parser = Parser::new(Rodeo::new());
+        let ast = parser.parse(source).expect("valid DSL should parse");
+
+        assert_eq!(ast.gateway.env_file.as_deref(), Some(".env"));
+        assert_eq!(ast.gateway.constants.len(), 2);
+        let EndpointOption::Secure(rules) = &ast.endpoints[0].options[0] else {
+            panic!("option should be secure");
+        };
+        assert!(rules[0].username.is_some());
+        assert!(rules[0].password.is_some());
+        assert_eq!(rules[0].checks.len(), 1);
     }
 
     #[test]

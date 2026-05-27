@@ -119,7 +119,18 @@ fn dump(args: DumpArgs) -> Result<(), ()> {
 }
 
 fn start(args: StartArgs) -> Result<(), ()> {
-    let ParsedConfig { ast, parser, plan } = parse_config(&args.config)?;
+    let ParsedConfig {
+        mut ast,
+        parser,
+        plan,
+    } = parse_config(&args.config)?;
+    if let Some(env_file) = args.env_file {
+        ast.gateway.env_file = Some(
+            resolve_config_path(&args.config, &env_file)
+                .display()
+                .to_string(),
+        );
+    }
 
     let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
     runtime_builder.enable_all();
@@ -159,7 +170,8 @@ fn parse_config(path: &Path) -> Result<ParsedConfig, ()> {
 
     let mut parser = Parser::new(Rodeo::new());
     match parser.parse(&source) {
-        Ok(ast) => {
+        Ok(mut ast) => {
+            resolve_gateway_paths(path, &mut ast);
             let plan = build_plan(&ast, &parser.interner).map_err(|err| {
                 emit_plan_error(&err);
             })?;
@@ -169,6 +181,31 @@ fn parse_config(path: &Path) -> Result<ParsedConfig, ()> {
             emit_parse_error(path, &source, &diagnostic);
             Err(())
         }
+    }
+}
+
+fn resolve_gateway_paths(config_path: &Path, ast: &mut FileAST) {
+    let Some(env_file) = ast.gateway.env_file.as_deref() else {
+        return;
+    };
+    let path = PathBuf::from(env_file);
+    if path.is_relative() {
+        ast.gateway.env_file = Some(
+            resolve_config_path(config_path, &path)
+                .display()
+                .to_string(),
+        );
+    }
+}
+
+fn resolve_config_path(config_path: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        config_path
+            .parent()
+            .map(|parent| parent.join(path))
+            .unwrap_or_else(|| path.to_path_buf())
     }
 }
 

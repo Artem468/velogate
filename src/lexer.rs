@@ -42,6 +42,8 @@ pub(crate) enum Token {
     Db,
     #[token("query")]
     Query,
+    #[token("env")]
+    Env,
     #[token("grpc")]
     Grpc,
     #[token("call")]

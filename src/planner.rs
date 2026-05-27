@@ -62,6 +62,7 @@ pub fn build_plan(ast: &FileAST, interner: &Rodeo) -> Result<ExecutionPlan, Plan
         .static_dbs
         .iter()
         .map(|db| db.name)
+        .chain(ast.gateway.constants.iter().map(|constant| constant.name))
         .collect::<HashSet<_>>();
     let endpoints = ast
         .endpoints
@@ -166,6 +167,16 @@ fn build_endpoint_plan(
             dependencies.insert(dep_idx);
         }
         steps[index].dependencies = dependencies.into_iter().collect();
+    }
+
+    for read in secure_reads(endpoint) {
+        if !globals.contains(&read) && !is_endpoint_context_var(read, endpoint, interner) {
+            return Err(PlanError::UndefinedVariable {
+                endpoint: endpoint_name.clone(),
+                variable: sym(interner, read),
+                used_by: "secure".to_string(),
+            });
+        }
     }
 
     let response_reads = response_reads(endpoint);
@@ -319,6 +330,29 @@ fn response_reads(endpoint: &Endpoint) -> BTreeSet<Sym> {
     reads
 }
 
+fn secure_reads(endpoint: &Endpoint) -> BTreeSet<Sym> {
+    let mut reads = BTreeSet::new();
+    for option in &endpoint.options {
+        if let EndpointOption::Secure(rules) = option {
+            for rule in rules {
+                if let Some(secret) = &rule.secret {
+                    collect_expr_reads(secret, &mut reads, &BTreeSet::new());
+                }
+                if let Some(username) = &rule.username {
+                    collect_expr_reads(username, &mut reads, &BTreeSet::new());
+                }
+                if let Some(password) = &rule.password {
+                    collect_expr_reads(password, &mut reads, &BTreeSet::new());
+                }
+                for check in &rule.checks {
+                    collect_expr_reads(check, &mut reads, &BTreeSet::new());
+                }
+            }
+        }
+    }
+    reads
+}
+
 fn collect_expr_reads(expr: &Expression, reads: &mut BTreeSet<Sym>, bound: &BTreeSet<Sym>) {
     match expr {
         Expression::Variable(name) => {
@@ -365,8 +399,10 @@ fn collect_call_callee_reads(
 
 fn is_endpoint_context_var(name: Sym, endpoint: &Endpoint, interner: &Rodeo) -> bool {
     let name = interner.resolve(&name);
-    matches!(name, "body" | "query" | "headers" | "cookies")
-        || route_param_names(&endpoint.path).any(|param| param == name)
+    matches!(
+        name,
+        "basic" | "body" | "env" | "jwt" | "query" | "headers" | "cookies"
+    ) || route_param_names(&endpoint.path).any(|param| param == name)
 }
 
 fn route_param_names(path: &str) -> impl Iterator<Item = &str> {

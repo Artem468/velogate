@@ -31,7 +31,7 @@ gateway "VeloGate-BFF" {
 }
 
 endpoint "GET /api/v1/dashboard" {
-    secure: [BearerJWT, Roles(["admin"])],
+    secure: [JWT { secret: "dev-secret", checks: [jwt.role == "admin"] }],
     rate_limit: 100/rps window 1s,
 
     // Эти два запроса запустятся ОДНОВРЕМЕННО (Слой 0)
