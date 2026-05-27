@@ -111,6 +111,8 @@ Step: Step = {
             var_name: interner.get_or_intern(&var),
             config: HttpConfig {
                 url,
+                method: cfg.method,
+                body: cfg.body,
                 timeout_ms: cfg.timeout_ms,
                 retries: cfg.retries,
                 delay_ms: cfg.delay_ms,
@@ -124,6 +126,8 @@ Step: Step = {
             var_name: interner.get_or_intern(&var),
             config: HttpConfig {
                 url,
+                method: cfg.method,
+                body: cfg.body,
                 timeout_ms: cfg.timeout_ms,
                 retries: cfg.retries,
                 delay_ms: cfg.delay_ms,
@@ -215,6 +219,8 @@ FetchConfigBlock: TailConfig = {
         let mut cfg = TailConfig::default();
         for entry in entries {
             match entry {
+                TailConfigEntry::Method(value) => cfg.method = Some(value),
+                TailConfigEntry::Body(value) => cfg.body = Some(value),
                 TailConfigEntry::Timeout(value) => cfg.timeout_ms = Some(value),
                 TailConfigEntry::Retry(value) => cfg.retries = Some(value),
                 TailConfigEntry::Delay(value) => cfg.delay_ms = Some(value),
@@ -233,6 +239,8 @@ ConfigEntryList: Vec<TailConfigEntry> = {
 };
 
 ConfigEntry: TailConfigEntry = {
+    "method" ":" <value:String> => TailConfigEntry::Method(value),
+    "body" ":" <value:Expression> => TailConfigEntry::Body(value),
     "timeout" ":" <value:Duration> => TailConfigEntry::Timeout(value),
     "retry" ":" <value:Int> "times" => TailConfigEntry::Retry(value as u32),
     "delay" ":" <value:Duration> => TailConfigEntry::Delay(value),
@@ -319,6 +327,7 @@ Primary: Expression = {
     <s:String> => Expression::String(s),
     "true" => Expression::Boolean(true),
     "false" => Expression::Boolean(false),
+    "body" => Expression::Variable(interner.get_or_intern("body")),
     "{" <obj:ResponseObject> "}" => Expression::Object(obj),
     "[" <items:ArrayItems> "]" => Expression::Array(items),
     "(" <e:Expression> ")" => e,
@@ -369,6 +378,8 @@ extern {
         "times" => Token::Times,
         "delay" => Token::Delay,
         "fallback" => Token::Fallback,
+        "method" => Token::Method,
+        "body" => Token::Body,
         "filter" => Token::Filter,
         "map" => Token::Map,
         "take" => Token::Take,

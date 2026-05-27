@@ -65,6 +65,10 @@ pub(crate) enum Token {
     Delay,
     #[token("fallback")]
     Fallback,
+    #[token("method")]
+    Method,
+    #[token("body")]
+    Body,
 
     #[token("filter")]
     Filter,

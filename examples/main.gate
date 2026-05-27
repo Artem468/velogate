@@ -28,20 +28,67 @@ endpoint "GET /api/v1/todos" {
 }
 
 endpoint "GET /api/v1/todos/:id" {
-    fetch "https://jsonplaceholder.typicode.com/todos/" + id as todo {
+    fetch "https://jsonplaceholder.typicode.com/todos/" + id as td {
+        method: "GET",
         timeout: 500ms,
         retry: 2 times,
         delay: 10ms,
-        fallback: { "id": id, "title": "fallback todo" }
+        fallback: { "id": id, "title": "fallback td" }
     };
 
     respond 200 {
-        "todo": todo,
+        "td": td,
         "request": {
             "id": id,
             "include": query.include,
             "user_agent": headers.user_agent,
             "session": cookies.session
         }
+    }
+}
+
+endpoint "POST /api/v1/todos" {
+    fetch "https://jsonplaceholder.typicode.com/todos" as created_todo {
+        method: "POST",
+        body: {
+            "title": body.title,
+            "completed": body.completed,
+            "userId": body.userId
+        },
+        timeout: 500ms,
+        retry: 2 times,
+        delay: 10ms,
+        fallback: {
+            "id": 0,
+            "title": body.title,
+            "completed": body.completed,
+            "userId": body.userId
+        }
+    };
+
+    respond 201 {
+        "created": created_todo,
+        "request_body": body
+    }
+}
+
+endpoint "PATCH /api/v1/todos/:id" {
+    fetch "https://jsonplaceholder.typicode.com/todos/" + id as updated_todo {
+        method: "PATCH",
+        body: {
+            "title": body.title,
+            "completed": body.completed
+        },
+        timeout: 500ms,
+        fallback: {
+            "id": id,
+            "title": body.title,
+            "completed": body.completed
+        }
+    };
+
+    respond 200 {
+        "updated": updated_todo,
+        "request_body": body
     }
 }

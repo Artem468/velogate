@@ -156,6 +156,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_fetch_method_and_body_config() {
+        let source = r#"
+            gateway "api" { port: 8080 }
+
+            endpoint "POST /v1/proxy" {
+                let created = fetch "https://example.com/items" {
+                    method: "PATCH",
+                    body: { "name": body.name, "active": true },
+                    timeout: 100ms
+                };
+                respond 200 { "created": created }
+            }
+        "#;
+
+        let mut parser = Parser::new(Rodeo::new());
+        let ast = parser.parse(source).expect("valid DSL should parse");
+
+        let Step::FetchHttp { config, .. } = &ast.endpoints[0].steps[0] else {
+            panic!("step should be HTTP fetch");
+        };
+        assert_eq!(config.method.as_deref(), Some("PATCH"));
+        assert!(config.body.is_some());
+        assert_eq!(config.timeout_ms, Some(100));
+    }
+
+    #[test]
     fn parses_grpc_call_step() {
         let source = r#"
             gateway "api" { port: 8080 }

@@ -61,6 +61,8 @@ pub enum BinaryOperator {
 #[derive(Debug, Clone)]
 pub struct HttpConfig {
     pub url: Expression,
+    pub method: Option<String>,
+    pub body: Option<Expression>,
     pub timeout_ms: Option<u64>,
     pub retries: Option<u32>,
     pub delay_ms: Option<u64>,
@@ -69,6 +71,8 @@ pub struct HttpConfig {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TailConfig {
+    pub method: Option<String>,
+    pub body: Option<Expression>,
     pub timeout_ms: Option<u64>,
     pub retries: Option<u32>,
     pub delay_ms: Option<u64>,
@@ -77,6 +81,8 @@ pub(crate) struct TailConfig {
 
 #[derive(Debug, Clone)]
 pub(crate) enum TailConfigEntry {
+    Method(String),
+    Body(Expression),
     Timeout(u64),
     Retry(u32),
     Delay(u64),

@@ -3,7 +3,7 @@ use crate::ast::{
     HttpConfig, PipeOp, Step, Sym,
 };
 use crate::planner::{EndpointPlan, ExecutionPlan};
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -14,7 +14,7 @@ use lasso::Rodeo;
 use prost::Message;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
 use prost_types::{ListValue, Struct, Value as ProstValue, value::Kind};
-use reqwest::Client;
+use reqwest::{Client, Method};
 use serde_json::{Map, Value as JsonValue, json};
 use sqlx::any::{AnyPoolOptions, install_default_drivers};
 use sqlx::{AnyPool, Column, Row, TypeInfo};
@@ -151,9 +151,14 @@ impl Runtime {
                 method,
                 move |Path(path_params): Path<HashMap<String, String>>,
                       Query(query_params): Query<HashMap<String, String>>,
-                      headers: HeaderMap| {
+                      headers: HeaderMap,
+                      body: Bytes| {
                     let runtime = Arc::clone(&handler_runtime);
-                    async move { runtime.handle(path_params, query_params, headers).await }
+                    async move {
+                        runtime
+                            .handle(path_params, query_params, headers, request_body_value(&body))
+                            .await
+                    }
                 },
             );
 
@@ -301,8 +306,9 @@ impl EndpointRuntime {
         path_params: HashMap<String, String>,
         query_params: HashMap<String, String>,
         headers: HeaderMap,
+        body: Value,
     ) -> Response {
-        match self.execute(path_params, query_params, &headers).await {
+        match self.execute(path_params, query_params, &headers, body).await {
             Ok(value) => {
                 let status =
                     StatusCode::from_u16(self.endpoint.response_status).unwrap_or(StatusCode::OK);
@@ -323,12 +329,14 @@ impl EndpointRuntime {
         path_params: HashMap<String, String>,
         query_params: HashMap<String, String>,
         headers: &HeaderMap,
+        body: Value,
     ) -> RuntimeResult<Value> {
         let mut vars = self.static_dbs.clone();
         vars.extend(request_vars(
             &path_params,
             &query_params,
             headers,
+            body,
             &self.interner,
         ));
 
@@ -402,11 +410,23 @@ async fn fetch_http(
     client: &Client,
 ) -> RuntimeResult<Value> {
     let url = as_string(eval_expr(&config.url, vars, interner)?);
+    let method_name = config.method.as_deref().unwrap_or("GET").to_uppercase();
+    let method = Method::from_bytes(method_name.as_bytes()).map_err(|err| {
+        RuntimeError::Execution(format!("invalid HTTP method `{method_name}` for fetch: {err}"))
+    })?;
+    let request_body = config
+        .body
+        .as_ref()
+        .map(|body| eval_expr(body, vars, interner))
+        .transpose()?;
     let attempts = config.retries.unwrap_or(0).saturating_add(1);
     let mut last_error = None;
 
     for attempt in 0..attempts {
-        let mut request = client.get(&url);
+        let mut request = client.request(method.clone(), &url);
+        if let Some(body) = &request_body {
+            request = request.json(body);
+        }
         if let Some(timeout_ms) = config.timeout_ms {
             request = request.timeout(Duration::from_millis(timeout_ms));
         }
@@ -1133,6 +1153,7 @@ fn request_vars(
     path_params: &HashMap<String, String>,
     query_params: &HashMap<String, String>,
     headers: &HeaderMap,
+    body: Value,
     interner: &Rodeo,
 ) -> Vars {
     let mut vars = Vars::new();
@@ -1173,8 +1194,20 @@ fn request_vars(
             .map(parse_cookies)
             .unwrap_or_default(),
     );
+    if let Some(sym) = interner.get("body") {
+        vars.insert(sym, body);
+    }
 
     vars
+}
+
+fn request_body_value(body: &Bytes) -> Value {
+    if body.is_empty() {
+        return Value::Null;
+    }
+
+    serde_json::from_slice(body)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(body).into()))
 }
 
 fn insert_string_var(vars: &mut Vars, interner: &Rodeo, name: &str, value: String) {
@@ -1564,6 +1597,53 @@ mod tests {
                 "arg": "1",
                 "trace": "abc",
                 "session": "s1"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_can_read_json_request_body_for_write_methods() {
+        let source = r#"
+            gateway "test" { port: 0 }
+
+            endpoint "PATCH /api/v1/todos/:id" {
+                respond 200 {
+                    "id": id,
+                    "title": body.title,
+                    "done": body.done
+                }
+            }
+        "#;
+
+        let router = test_router(source);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/v1/todos/42")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"title":"ship body support","done":true}"#,
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body should read");
+        let actual: Value = serde_json::from_slice(&body).expect("body should be JSON");
+
+        assert_eq!(
+            actual,
+            json!({
+                "id": "42",
+                "title": "ship body support",
+                "done": true
             })
         );
     }

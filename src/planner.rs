@@ -263,6 +263,9 @@ fn step_reads(step: &Step) -> BTreeSet<Sym> {
         Step::Let { value, .. } => collect_expr_reads(value, &mut reads, &BTreeSet::new()),
         Step::FetchHttp { config, .. } => {
             collect_expr_reads(&config.url, &mut reads, &BTreeSet::new());
+            if let Some(body) = &config.body {
+                collect_expr_reads(body, &mut reads, &BTreeSet::new());
+            }
             if let Some(fallback) = &config.fallback {
                 collect_expr_reads(fallback, &mut reads, &BTreeSet::new());
             }
@@ -362,7 +365,7 @@ fn collect_call_callee_reads(
 
 fn is_endpoint_context_var(name: Sym, endpoint: &Endpoint, interner: &Rodeo) -> bool {
     let name = interner.resolve(&name);
-    matches!(name, "query" | "headers" | "cookies")
+    matches!(name, "body" | "query" | "headers" | "cookies")
         || route_param_names(&endpoint.path).any(|param| param == name)
 }
 
