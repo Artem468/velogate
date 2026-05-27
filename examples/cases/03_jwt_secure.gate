@@ -1,0 +1,22 @@
+gateway "jwt-secure" {
+    port: 8093,
+    env_file: "secure.env"
+}
+
+endpoint "GET /api/v1/users/:id/profile" {
+    secure: [
+        JWT {
+            secret: env.JWT_SECRET,
+            checks: [
+                jwt.sub == id,
+                jwt.role == "admin" || jwt.role == "user"
+            ]
+        }
+    ],
+
+    respond 200 {
+        "user_id": jwt.sub,
+        "role": jwt.role,
+        "claims": jwt
+    }
+}

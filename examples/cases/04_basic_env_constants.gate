@@ -1,0 +1,26 @@
+gateway "basic-env-constants" {
+    port: 8094,
+    env_file: "secure.env",
+    constants: {
+        "service_name": "admin-api",
+        "allowed_user": "admin"
+    }
+}
+
+endpoint "GET /api/v1/admin/health" {
+    secure: [
+        Basic {
+            username: allowed_user,
+            password: env.ADMIN_PASSWORD,
+            checks: [
+                basic.username == allowed_user
+            ]
+        }
+    ],
+
+    respond 200 {
+        "ok": true,
+        "service": service_name,
+        "user": basic.username
+    }
+}

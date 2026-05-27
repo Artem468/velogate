@@ -1,0 +1,50 @@
+gateway "write-body" {
+    port: 8092,
+    constants: {
+        "api_base": "https://jsonplaceholder.typicode.com"
+    }
+}
+
+endpoint "POST /api/v1/todos" {
+    fetch api_base + "/todos" as created {
+        method: "POST",
+        body: {
+            "title": body.title,
+            "completed": body.completed,
+            "userId": body.userId
+        },
+        timeout: 500ms,
+        fallback: {
+            "id": 0,
+            "title": body.title,
+            "completed": body.completed,
+            "userId": body.userId
+        }
+    };
+
+    respond 201 {
+        "created": created,
+        "input": body
+    }
+}
+
+endpoint "PATCH /api/v1/todos/:id" {
+    fetch api_base + "/todos/" + id as updated {
+        method: "PATCH",
+        body: {
+            "title": body.title,
+            "completed": body.completed
+        },
+        timeout: 500ms,
+        fallback: {
+            "id": id,
+            "title": body.title,
+            "completed": body.completed
+        }
+    };
+
+    respond 200 {
+        "updated": updated,
+        "input": body
+    }
+}

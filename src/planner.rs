@@ -314,7 +314,7 @@ fn step_reads(step: &Step) -> BTreeSet<Sym> {
                             collect_expr_reads(expr, &mut reads, &bound);
                         }
                     }
-                    PipeOp::Take(_) => {}
+                    PipeOp::Take(count) => collect_expr_reads(count, &mut reads, &BTreeSet::new()),
                 }
             }
         }

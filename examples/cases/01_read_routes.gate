@@ -1,0 +1,39 @@
+gateway "read-routes" {
+    port: 8091,
+    constants: {
+        "api_base": "https://jsonplaceholder.typicode.com"
+    }
+}
+
+endpoint "GET /api/v1/todos" {
+    fetch api_base + "/todos" as todos {
+        timeout: 500ms,
+        fallback: []
+    };
+
+    let visible = todos
+        | filter(todo => todo.id <= 5)
+        | map(todo => {
+            "id": todo.id,
+            "title": todo.title,
+            "done": todo.completed
+        });
+
+    respond 200 {
+        "items": visible,
+        "debug_query": query
+    }
+}
+
+endpoint "GET /api/v1/todos/:id" {
+    fetch api_base + "/todos/" + id as todo {
+        timeout: 500ms,
+        fallback: { "id": id, "title": "fallback" }
+    };
+
+    respond 200 {
+        "id": id,
+        "todo": todo,
+        "trace": headers.x_trace_id
+    }
+}

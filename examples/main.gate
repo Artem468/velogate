@@ -26,7 +26,7 @@ endpoint "GET /api/v1/todos" {
             "user_id": t.userId,
             "title": t.title
           })
-        | take(100);
+        | take(default_take);
 
     respond 200 {
         "service": service_name,

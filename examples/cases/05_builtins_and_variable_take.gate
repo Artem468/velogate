@@ -1,0 +1,28 @@
+gateway "builtins-and-variable-take" {
+    port: 8095,
+    constants: {
+        "default_take": 2,
+        "allowed_roles": ["admin", "ops"]
+    }
+}
+
+endpoint "GET /api/v1/users/:role" {
+    let users = [
+        { "name": " Ada ", "role": "admin" },
+        { "name": "Grace", "role": "ops" },
+        { "name": "Linus", "role": "guest" }
+    ];
+
+    let visible = users
+        | filter(user => contains(allowed_roles, user.role) && user.name.trim().lower().contains("a"))
+        | map(user => {
+            "name": user.name.trim(),
+            "label": format("{}:{}", user.role.upper(), user.name.trim())
+        })
+        | take(default_take);
+
+    respond 200 {
+        "role_allowed": contains(allowed_roles, role),
+        "visible": visible
+    }
+}

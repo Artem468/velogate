@@ -300,7 +300,7 @@ PipeOp: PipeOp = {
             layout,
         }
     },
-    "|" "take" "(" <count:Int> ")" => PipeOp::Take(count as usize),
+    "|" "take" "(" <count:Expression> ")" => PipeOp::Take(count),
 };
 
 FetchConfigBlock: TailConfig = {

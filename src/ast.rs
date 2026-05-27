@@ -137,7 +137,7 @@ pub enum PipeOp {
         param: Sym,
         layout: HashMap<String, Expression>,
     },
-    Take(usize),
+    Take(Expression),
 }
 
 #[derive(Debug, Clone)]

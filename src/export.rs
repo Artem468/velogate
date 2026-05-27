@@ -133,7 +133,7 @@ pub enum PipeOpExport {
         layout: BTreeMap<String, ExprExport>,
     },
     Take {
-        count: usize,
+        count: ExprExport,
     },
 }
 
@@ -385,7 +385,9 @@ fn export_pipe_op(op: &PipeOp, interner: &Rodeo) -> PipeOpExport {
                 .map(|(key, value)| (key.clone(), export_expr(value, interner)))
                 .collect(),
         },
-        PipeOp::Take(count) => PipeOpExport::Take { count: *count },
+        PipeOp::Take(count) => PipeOpExport::Take {
+            count: export_expr(count, interner),
+        },
     }
 }
 
@@ -472,7 +474,7 @@ fn step_var_and_deps(step: &Step, interner: &Rodeo) -> (String, Vec<String>) {
                         }
                         deps.retain(|dep| dep != &bound);
                     }
-                    PipeOp::Take(_) => {}
+                    PipeOp::Take(count) => collect_expr_deps(count, interner, &mut deps),
                 }
             }
             sym(interner, *var_name)
