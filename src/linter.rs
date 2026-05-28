@@ -108,6 +108,16 @@ fn lint_endpoints(ast: &FileAST, interner: &Rodeo, warnings: &mut Vec<LintWarnin
                 Step::CallGrpc { var_name, config } => {
                     lint_grpc_call(&endpoint_name, interner.resolve(var_name), config, warnings);
                 }
+                Step::Command { var_name, .. } => {
+                    warn(
+                        warnings,
+                        "command_step",
+                        format!(
+                            "command `{}` in endpoint `{endpoint_name}` executes a local shell command",
+                            interner.resolve(var_name)
+                        ),
+                    );
+                }
                 Step::Let { .. } | Step::Pipe { .. } => {}
             }
         }
@@ -212,6 +222,7 @@ fn collect_endpoint_reads(endpoint: &Endpoint, reads: &mut HashSet<Sym>) {
 fn collect_step_reads(step: &Step, reads: &mut HashSet<Sym>) {
     match step {
         Step::Let { value, .. } => collect_expr_reads(value, reads, &HashSet::new()),
+        Step::Command { .. } => {}
         Step::FetchHttp { config, .. } => {
             collect_expr_reads(&config.url, reads, &HashSet::new());
             collect_optional_expr_reads(config.body.as_ref(), reads, &HashSet::new());

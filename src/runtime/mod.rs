@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::process::Command as ProcessCommand;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tonic::client::Grpc;
@@ -297,6 +298,7 @@ async fn execute_step(
 ) -> RuntimeResult<Value> {
     match step {
         Step::Let { value, .. } => eval_expr(value, vars, interner),
+        Step::Command { command, .. } => execute_command(command).await,
         Step::FetchHttp { config, .. } => fetch_http(config, vars, interner, deps.client).await,
         Step::Pipe {
             source, operations, ..
@@ -308,6 +310,32 @@ async fn execute_step(
             query_db(config, vars, interner, deps.db_urls, deps.db_pools).await
         }
     }
+}
+
+async fn execute_command(command: &str) -> RuntimeResult<Value> {
+    let output = shell_command(command).output().await.map_err(|err| {
+        RuntimeError::Execution(format!("command `{command}` failed to start: {err}"))
+    })?;
+    Ok(json!({
+        "success": output.status.success(),
+        "status": output.status.code(),
+        "stdout": String::from_utf8_lossy(&output.stdout).trim_end().to_string(),
+        "stderr": String::from_utf8_lossy(&output.stderr).trim_end().to_string(),
+    }))
+}
+
+#[cfg(target_os = "windows")]
+fn shell_command(command: &str) -> ProcessCommand {
+    let mut process = ProcessCommand::new("powershell");
+    process.args(["-NoProfile", "-Command", command]);
+    process
+}
+
+#[cfg(not(target_os = "windows"))]
+fn shell_command(command: &str) -> ProcessCommand {
+    let mut process = ProcessCommand::new("sh");
+    process.args(["-c", command]);
+    process
 }
 
 async fn fetch_http(

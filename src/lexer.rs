@@ -60,6 +60,8 @@ pub(crate) enum Token {
     Grpc,
     #[token("call")]
     Call,
+    #[token("command")]
+    Command,
     #[token("as")]
     As,
     #[token("if")]
@@ -94,6 +96,8 @@ pub(crate) enum Token {
     Map,
     #[token("take")]
     Take,
+    #[token("sync")]
+    Sync,
 
     #[regex(r"[a-zA-Z_][a-zA-Z0-9_]*", |lex| lex.slice().to_string())]
     Ident(String),

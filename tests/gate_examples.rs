@@ -11,6 +11,7 @@ const EXAMPLES: &[&str] = &[
     "examples/cases/03_jwt_secure.gate",
     "examples/cases/04_basic_env_constants.gate",
     "examples/cases/05_builtins_and_variable_take.gate",
+    "examples/cases/06_sync_and_command.gate",
 ];
 
 #[test]

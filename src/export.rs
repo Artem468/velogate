@@ -1,6 +1,7 @@
 use crate::ast::*;
 use lasso::Rodeo;
 use serde::Serialize;
+use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Serialize)]
@@ -72,6 +73,10 @@ pub enum StepExport {
     Let {
         var_name: String,
         value: ExprExport,
+    },
+    Command {
+        var_name: String,
+        command: String,
     },
     FetchHttp {
         var_name: String,
@@ -253,6 +258,89 @@ pub fn export_dot(ast: &FileAST, interner: &Rodeo) -> String {
     out
 }
 
+pub fn export_openapi(ast: &FileAST, interner: &Rodeo) -> Value {
+    let mut paths = Map::new();
+    let mut security_schemes = Map::new();
+
+    for endpoint in &ast.endpoints {
+        let path = openapi_path(&endpoint.path);
+        let method = endpoint.method.to_ascii_lowercase();
+        let path_item = paths.entry(path).or_insert_with(|| json!({}));
+        let Value::Object(methods) = path_item else {
+            continue;
+        };
+
+        let (security, route_schemes) = openapi_security(endpoint, interner);
+        for (name, scheme) in route_schemes {
+            security_schemes.entry(name).or_insert(scheme);
+        }
+
+        let mut operation = Map::new();
+        operation.insert(
+            "operationId".to_string(),
+            json!(operation_id(&endpoint.method, &endpoint.path)),
+        );
+        operation.insert(
+            "summary".to_string(),
+            json!(format!("{} {}", endpoint.method, endpoint.path)),
+        );
+        operation.insert(
+            "parameters".to_string(),
+            json!(path_parameters(&endpoint.path)),
+        );
+        if !security.is_empty() {
+            operation.insert("security".to_string(), Value::Array(security));
+        }
+        if let Some(rate_limit) = openapi_rate_limit(endpoint, interner) {
+            operation.insert("x-rate-limit".to_string(), rate_limit);
+        }
+        if matches!(endpoint.method.as_str(), "POST" | "PUT" | "PATCH") {
+            operation.insert(
+                "requestBody".to_string(),
+                json!({
+                    "required": false,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "additionalProperties": true
+                            }
+                        }
+                    }
+                }),
+            );
+        }
+        operation.insert(
+            "responses".to_string(),
+            json!({
+                endpoint.response.status.to_string(): {
+                    "description": response_description(endpoint.response.status),
+                    "content": {
+                        "application/json": {
+                            "schema": response_schema(&endpoint.response, interner)
+                        }
+                    }
+                }
+            }),
+        );
+
+        methods.insert(method, Value::Object(operation));
+    }
+
+    json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": ast.gateway.name,
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        "servers": [openapi_server(ast)],
+        "paths": paths,
+        "components": {
+            "securitySchemes": security_schemes
+        }
+    })
+}
+
 fn export_endpoint(endpoint: &Endpoint, interner: &Rodeo) -> EndpointExport {
     EndpointExport {
         method: endpoint.method.clone(),
@@ -288,11 +376,168 @@ fn export_endpoint(endpoint: &Endpoint, interner: &Rodeo) -> EndpointExport {
     }
 }
 
+fn openapi_server(ast: &FileAST) -> Value {
+    let host = ast.gateway.host.as_deref().unwrap_or("127.0.0.1");
+    json!({ "url": format!("http://{host}:{}", ast.gateway.port) })
+}
+
+fn openapi_path(path: &str) -> String {
+    path.split('/')
+        .map(|segment| {
+            segment
+                .strip_prefix(':')
+                .map(|name| format!("{{{name}}}"))
+                .unwrap_or_else(|| segment.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn path_parameters(path: &str) -> Vec<Value> {
+    path.split('/')
+        .filter_map(|segment| segment.strip_prefix(':'))
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            json!({
+                "name": name,
+                "in": "path",
+                "required": true,
+                "schema": { "type": "string" }
+            })
+        })
+        .collect()
+}
+
+fn openapi_security(endpoint: &Endpoint, interner: &Rodeo) -> (Vec<Value>, Vec<(String, Value)>) {
+    let mut requirement = Map::new();
+    let mut schemes = Vec::new();
+
+    for option in &endpoint.options {
+        let EndpointOption::Secure(rules) = option else {
+            continue;
+        };
+        for rule in rules {
+            let scheme = sym(interner, rule.scheme);
+            let name = security_scheme_name(&scheme);
+            requirement.insert(name.clone(), json!([]));
+            schemes.push((name, security_scheme(&scheme)));
+        }
+    }
+
+    let requirements = if requirement.is_empty() {
+        Vec::new()
+    } else {
+        vec![Value::Object(requirement)]
+    };
+
+    (requirements, schemes)
+}
+
+fn security_scheme_name(scheme: &str) -> String {
+    match scheme.to_ascii_lowercase().as_str() {
+        "jwt" => "jwtAuth".to_string(),
+        "basic" => "basicAuth".to_string(),
+        other => format!("{other}Auth"),
+    }
+}
+
+fn security_scheme(scheme: &str) -> Value {
+    match scheme.to_ascii_lowercase().as_str() {
+        "jwt" => json!({ "type": "http", "scheme": "bearer", "bearerFormat": "JWT" }),
+        "basic" => json!({ "type": "http", "scheme": "basic" }),
+        _ => json!({ "type": "apiKey", "in": "header", "name": "Authorization" }),
+    }
+}
+
+fn openapi_rate_limit(endpoint: &Endpoint, interner: &Rodeo) -> Option<Value> {
+    endpoint.options.iter().find_map(|option| match option {
+        EndpointOption::RateLimit {
+            limit,
+            unit,
+            window_ms,
+        } => Some(json!({
+            "limit": limit,
+            "unit": sym(interner, *unit),
+            "window_ms": window_ms,
+            "key": "ip"
+        })),
+        EndpointOption::Secure(_) => None,
+    })
+}
+
+fn response_schema(response: &EndpointResponse, interner: &Rodeo) -> Value {
+    match &response.body {
+        Some(body) => object_schema(body, interner),
+        None => json!({ "type": "object", "additionalProperties": true }),
+    }
+}
+
+fn object_schema(
+    fields: &std::collections::HashMap<String, Expression>,
+    interner: &Rodeo,
+) -> Value {
+    let mut properties = Map::new();
+    for (key, value) in fields {
+        properties.insert(key.clone(), expr_schema(value, interner));
+    }
+    json!({
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": true
+    })
+}
+
+fn expr_schema(expr: &Expression, interner: &Rodeo) -> Value {
+    match expr {
+        Expression::String(_) => json!({ "type": "string" }),
+        Expression::Number(_) => json!({ "type": "number" }),
+        Expression::Boolean(_) => json!({ "type": "boolean" }),
+        Expression::Object(fields) => object_schema(fields, interner),
+        Expression::Array(items) => {
+            let item_schema = items
+                .first()
+                .map(|item| expr_schema(item, interner))
+                .unwrap_or_else(|| json!({}));
+            json!({ "type": "array", "items": item_schema })
+        }
+        Expression::Variable(_)
+        | Expression::PropertyAccess(_, _)
+        | Expression::Call { .. }
+        | Expression::BinaryOp(_, _, _) => json!({}),
+    }
+}
+
+fn response_description(status: u16) -> &'static str {
+    match status {
+        100..=199 => "Informational response",
+        200..=299 => "Successful response",
+        300..=399 => "Redirect response",
+        400..=499 => "Client error response",
+        500..=599 => "Server error response",
+        _ => "Response",
+    }
+}
+
+fn operation_id(method: &str, path: &str) -> String {
+    let mut out = method.to_ascii_lowercase();
+    for segment in path.split('/').filter(|segment| !segment.is_empty()) {
+        out.push('_');
+        out.push_str(segment.trim_start_matches(':'));
+    }
+    out.chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect()
+}
+
 fn export_step(step: &Step, interner: &Rodeo) -> StepExport {
     match step {
         Step::Let { var_name, value } => StepExport::Let {
             var_name: sym(interner, *var_name),
             value: export_expr(value, interner),
+        },
+        Step::Command { var_name, command } => StepExport::Command {
+            var_name: sym(interner, *var_name),
+            command: command.clone(),
         },
         Step::FetchHttp { var_name, config } => StepExport::FetchHttp {
             var_name: sym(interner, *var_name),
@@ -450,6 +695,7 @@ fn step_var_and_deps(step: &Step, interner: &Rodeo) -> (String, Vec<String>) {
             collect_expr_deps(value, interner, &mut deps);
             sym(interner, *var_name)
         }
+        Step::Command { var_name, .. } => sym(interner, *var_name),
         Step::FetchHttp { var_name, config } => {
             collect_expr_deps(&config.url, interner, &mut deps);
             if let Some(body) = &config.body {

@@ -30,6 +30,7 @@ pub struct PlannedStep {
 #[serde(rename_all = "snake_case")]
 pub enum StepKind {
     Let,
+    Command,
     FetchHttp,
     CallGrpc,
     QueryDb,
@@ -208,13 +209,17 @@ fn build_endpoint_plan(
 fn build_layers(steps: &[PlannedStep], endpoint: &Endpoint) -> Result<Vec<Vec<usize>>, PlanError> {
     let mut state = vec![VisitState::Unvisited; steps.len()];
     let mut depths = vec![0; steps.len()];
-    let mut layers = Vec::<Vec<usize>>::new();
 
     for step in 0..steps.len() {
-        let depth =
-            step_depth(step, steps, &mut state, &mut depths).map_err(|_| PlanError::Cycle {
-                endpoint: format!("{} {}", endpoint.method, endpoint.path),
-            })?;
+        step_depth(step, steps, &mut state, &mut depths).map_err(|_| PlanError::Cycle {
+            endpoint: format!("{} {}", endpoint.method, endpoint.path),
+        })?;
+    }
+
+    apply_sync_boundaries(&mut depths, &endpoint.sync_boundaries);
+
+    let mut layers = Vec::<Vec<usize>>::new();
+    for (step, depth) in depths.into_iter().enumerate() {
         if layers.len() <= depth {
             layers.resize_with(depth + 1, Vec::new);
         }
@@ -222,6 +227,24 @@ fn build_layers(steps: &[PlannedStep], endpoint: &Endpoint) -> Result<Vec<Vec<us
     }
 
     Ok(layers)
+}
+
+fn apply_sync_boundaries(depths: &mut [usize], sync_boundaries: &[usize]) {
+    let boundaries = sync_boundaries
+        .iter()
+        .copied()
+        .filter(|boundary| *boundary < depths.len())
+        .collect::<HashSet<_>>();
+    let mut floor = 0usize;
+    let mut previous_max = 0usize;
+
+    for (step_idx, depth) in depths.iter_mut().enumerate() {
+        if boundaries.contains(&step_idx) {
+            floor = previous_max + 1;
+        }
+        *depth = (*depth).max(floor);
+        previous_max = previous_max.max(*depth);
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -258,6 +281,7 @@ fn step_depth(
 fn step_kind(step: &Step) -> StepKind {
     match step {
         Step::Let { .. } => StepKind::Let,
+        Step::Command { .. } => StepKind::Command,
         Step::FetchHttp { .. } => StepKind::FetchHttp,
         Step::CallGrpc { .. } => StepKind::CallGrpc,
         Step::QueryDb { .. } => StepKind::QueryDb,
@@ -269,6 +293,7 @@ fn step_reads(step: &Step) -> BTreeSet<Sym> {
     let mut reads = BTreeSet::new();
     match step {
         Step::Let { value, .. } => collect_expr_reads(value, &mut reads, &BTreeSet::new()),
+        Step::Command { .. } => {}
         Step::FetchHttp { config, .. } => {
             collect_expr_reads(&config.url, &mut reads, &BTreeSet::new());
             if let Some(body) = &config.body {
@@ -501,5 +526,28 @@ mod tests {
                 ..
             } if variable == "x"
         ));
+    }
+
+    #[test]
+    fn sync_block_forces_source_order_layers() {
+        let source = r#"
+            gateway "api" { port: 8080 }
+
+            endpoint "GET /x" {
+                let before = 0;
+                sync {
+                    let a = 1;
+                    let b = 2;
+                }
+                let after = 3;
+                respond 200 { "a": a, "b": b, "after": after, "before": before }
+            }
+        "#;
+        let mut parser = Parser::new(Rodeo::new());
+        let ast = parser.parse(source).expect("source should parse");
+        let plan = build_plan(&ast, &parser.interner).expect("source should plan");
+        let endpoint = &plan.endpoints[0];
+
+        assert_eq!(endpoint.layers, vec![vec![0], vec![1], vec![2], vec![3]]);
     }
 }

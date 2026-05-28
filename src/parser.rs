@@ -158,6 +158,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_command_step() {
+        let source = r#"
+            gateway "api" { port: 8080 }
+
+            endpoint "GET /health" {
+                command "echo ok" as shell;
+                let version = command "echo 1";
+                respond 200 {
+                    "shell": shell.stdout,
+                    "version": version.stdout
+                }
+            }
+        "#;
+
+        let mut parser = Parser::new(Rodeo::new());
+        let ast = parser.parse(source).expect("valid DSL should parse");
+
+        assert_eq!(ast.endpoints[0].steps.len(), 2);
+        assert!(matches!(ast.endpoints[0].steps[0], Step::Command { .. }));
+        assert!(matches!(ast.endpoints[0].steps[1], Step::Command { .. }));
+    }
+
+    #[test]
     fn parses_fetch_method_and_body_config() {
         let source = r#"
             gateway "api" { port: 8080 }
@@ -313,7 +336,9 @@ mod tests {
                 respond 200 {
                     "user": basic.username,
                     "env": body.env_file,
-                    "checks": jwt.checks
+                    "checks": jwt.checks,
+                    "command": body.command,
+                    "sync": body.sync
                 }
             }
         "#;

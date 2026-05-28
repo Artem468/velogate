@@ -450,6 +450,49 @@ layer 0: user, weather
 layer 1: orders
 ```
 
+Force sequential execution with `sync`:
+
+```rust
+endpoint "GET /ops/health" {
+    command "echo before" as before;
+
+    sync {
+        command "echo first" as first;
+        command "echo second" as second;
+    }
+
+    let label = "after-sync";
+
+    respond 200 {
+        "before": before.stdout,
+        "first": first.stdout,
+        "second": second.stdout,
+        "label": label
+    }
+}
+```
+
+Plan:
+
+```text
+layer 0: before
+layer 1: first
+layer 2: second
+layer 3: label
+```
+
+Run a local shell command with `command "..." as name;` or
+`let name = command "...";`. The result is an object:
+
+```json
+{
+  "success": true,
+  "status": 0,
+  "stdout": "ok",
+  "stderr": ""
+}
+```
+
 Planner также отклоняет:
 
 - дубликаты переменных;

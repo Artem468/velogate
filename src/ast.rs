@@ -147,6 +147,10 @@ pub enum Step {
         var_name: Sym,
         value: Expression,
     },
+    Command {
+        var_name: Sym,
+        command: String,
+    },
     FetchHttp {
         var_name: Sym,
         config: HttpConfig,
@@ -170,6 +174,7 @@ impl Step {
     pub fn var_name(&self) -> Sym {
         match self {
             Self::Let { var_name, .. }
+            | Self::Command { var_name, .. }
             | Self::FetchHttp { var_name, .. }
             | Self::CallGrpc { var_name, .. }
             | Self::QueryDb { var_name, .. }
@@ -214,6 +219,12 @@ pub(crate) enum SecureRuleConfigEntry {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) enum EndpointBodyItem {
+    Step(Step),
+    Sync(Vec<Step>),
+}
+
+#[derive(Debug, Clone)]
 pub struct EndpointResponse {
     pub status: u16,
     pub status_raw: i64,
@@ -254,6 +265,7 @@ pub struct Endpoint {
     pub path: String,
     pub options: Vec<EndpointOption>,
     pub steps: Vec<Step>,
+    pub sync_boundaries: Vec<usize>,
     pub response: EndpointResponse,
 }
 

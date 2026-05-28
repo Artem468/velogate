@@ -696,6 +696,44 @@ async fn builtins_and_take_can_read_variables() {
     );
 }
 
+#[tokio::test]
+async fn command_step_exposes_status_stdout_and_stderr() {
+    let source = r#"
+        gateway "api" { port: 8080 }
+
+        endpoint "GET /health" {
+            command "echo ok" as shell;
+
+            respond 200 {
+                "success": shell.success,
+                "status": shell.status,
+                "stdout": shell.stdout,
+                "stderr": shell.stderr
+            }
+        }
+    "#;
+    let router = test_router(source);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("route should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("body should read");
+    let body: Value = serde_json::from_slice(&body).expect("body should be JSON");
+    assert_eq!(body["success"], true);
+    assert_eq!(body["status"], 0);
+    assert_eq!(body["stdout"], "ok");
+    assert_eq!(body["stderr"], "");
+}
+
 fn test_router(source: &str) -> axum::Router {
     let mut parser = Parser::new(Rodeo::new());
     let ast = parser.parse(source).expect("test DSL should parse");

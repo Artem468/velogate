@@ -1,0 +1,21 @@
+gateway "sync-command" {
+    port: 8080
+}
+
+endpoint "GET /ops/health" {
+    command "echo before" as before;
+
+    sync {
+        command "echo first" as first;
+        command "echo second" as second;
+    }
+
+    let label = "after-sync";
+
+    respond 200 {
+        "before": before.stdout,
+        "first": first.stdout,
+        "second": second.stdout,
+        "label": label
+    }
+}

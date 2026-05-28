@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use velogate::ast::{EndpointOption, FileAST};
-use velogate::export::export_file;
+use velogate::export::{export_file, export_openapi};
 use velogate::linter::{LintWarning, lint_file};
 use velogate::parser::{ParseDiagnostic, Parser};
 use velogate::planner::{ExecutionPlan, PlanError, build_plan, export_plan_dot};
@@ -84,6 +84,7 @@ enum DumpFormat {
     Ast,
     Json,
     Graph,
+    Openapi,
     Plan,
 }
 
@@ -260,6 +261,13 @@ fn dump(args: DumpArgs) -> Result<(), ()> {
             println!("{json}");
         }
         DumpFormat::Graph => print!("{}", export_plan_dot(&plan)),
+        DumpFormat::Openapi => {
+            let document = export_openapi(&ast, &parser.interner);
+            let json = serde_json::to_string_pretty(&document).map_err(|err| {
+                eprintln!("failed to serialize OpenAPI document as JSON: {err}");
+            })?;
+            println!("{json}");
+        }
         DumpFormat::Plan => {
             let json = serde_json::to_string_pretty(&plan).map_err(|err| {
                 eprintln!("failed to serialize execution plan as JSON: {err}");

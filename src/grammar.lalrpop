@@ -86,15 +86,38 @@ StaticProto: StaticProto = {
 };
 
 Endpoint: Endpoint = {
-    "endpoint" <path_method:String> "{" <options:EndpointOption*> <steps:Step*> <response:EndpointResponse> "}" => {
+    "endpoint" <path_method:String> "{" <options:EndpointOption*> <items:EndpointBodyItem*> <response:EndpointResponse> "}" => {
         let mut parts = path_method.split_whitespace();
         let method = parts.next().unwrap_or("GET").to_string();
         let path = parts.next().unwrap_or("/").to_string();
+        let mut steps = Vec::new();
+        let mut sync_boundaries = Vec::new();
+        for item in items {
+            match item {
+                EndpointBodyItem::Step(step) => steps.push(step),
+                EndpointBodyItem::Sync(sync_steps) => {
+                    let block_start = steps.len();
+                    if block_start > 0 {
+                        sync_boundaries.push(block_start);
+                    }
+                    for step in sync_steps {
+                        if steps.len() > block_start {
+                            sync_boundaries.push(steps.len());
+                        }
+                        steps.push(step);
+                    }
+                    if steps.len() > block_start {
+                        sync_boundaries.push(steps.len());
+                    }
+                }
+            }
+        }
         Endpoint {
             method,
             path,
             options,
             steps,
+            sync_boundaries,
             response,
         }
     }
@@ -227,6 +250,8 @@ IdentLike: String = {
     "checks" => "checks".to_string(),
     "env_file" => "env_file".to_string(),
     "constants" => "constants".to_string(),
+    "command" => "command".to_string(),
+    "sync" => "sync".to_string(),
 };
 
 Step: Step = {
@@ -258,6 +283,18 @@ Step: Step = {
                 delay_ms: cfg.delay_ms,
                 fallback: cfg.fallback,
             }
+        }
+    },
+    "command" <command:String> "as" <var:Ident> ";" => {
+        Step::Command {
+            var_name: interner.get_or_intern(&var),
+            command,
+        }
+    },
+    "let" <var:Ident> "=" "command" <command:String> ";" => {
+        Step::Command {
+            var_name: interner.get_or_intern(&var),
+            command,
         }
     },
     "let" <var:Ident> "=" "db" "::" "query" "(" <db_source:Expression> "," <sql:String> <params:DbQueryParams> ")" <cfg:FetchConfigBlock?> ";" => {
@@ -316,6 +353,11 @@ Step: Step = {
             value,
         }
     },
+};
+
+EndpointBodyItem: EndpointBodyItem = {
+    <step:Step> => EndpointBodyItem::Step(step),
+    "sync" "{" <steps:Step*> "}" => EndpointBodyItem::Sync(steps),
 };
 
 DbQueryParams: Vec<Expression> = {
@@ -506,6 +548,7 @@ extern {
         "env" => Token::Env,
         "grpc" => Token::Grpc,
         "call" => Token::Call,
+        "command" => Token::Command,
         "as" => Token::As,
         "respond" => Token::Respond,
         "timeout" => Token::Timeout,
@@ -520,6 +563,7 @@ extern {
         "filter" => Token::Filter,
         "map" => Token::Map,
         "take" => Token::Take,
+        "sync" => Token::Sync,
         "window" => Token::Window,
         "true" => Token::True,
         "false" => Token::False,
