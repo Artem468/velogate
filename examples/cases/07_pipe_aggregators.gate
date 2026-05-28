@@ -1,0 +1,47 @@
+gateway "pipe-aggregators" {
+    port: 8080
+}
+
+endpoint "GET /reports/items" {
+    let items = [
+        { "id": 2, "group": "b", "score": 5, "tags": ["x"] },
+        { "id": 1, "group": "a", "score": 3, "tags": ["a", "b"] },
+        { "id": 1, "group": "a", "score": 7, "tags": ["c"] }
+    ];
+
+    let filtered = items | filter(item => item.score > 3);
+    let mapped = items | map(item => { "id": item.id, "score": item.score });
+    let sorted = items | sort(item => item.score);
+    let page = sorted | offset(1) | limit(2);
+    let groups = items | group_by(item => item.group);
+    let total = items | sum(item => item.score);
+    let average = items | avg(item => item.score);
+    let minimum = items | min(item => item.score);
+    let maximum = items | max(item => item.score);
+    let unique_ids = items | unique(item => item.id) | map(item => item.id);
+    let tags = items | flat_map(item => item.tags);
+    let reduced = items | reduce(0, acc, item => acc + item.score);
+    let first_item = items | first();
+    let last_item = items | last();
+    let total_count = items | count();
+    let legacy_top = items | take(2);
+
+    respond 200 {
+        "filtered": filtered,
+        "mapped": mapped,
+        "sorted": sorted,
+        "page": page,
+        "groups": groups,
+        "total": total,
+        "average": average,
+        "minimum": minimum,
+        "maximum": maximum,
+        "unique_ids": unique_ids,
+        "tags": tags,
+        "reduced": reduced,
+        "first": first_item,
+        "last": last_item,
+        "count": total_count,
+        "legacy_top": legacy_top
+    }
+}

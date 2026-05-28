@@ -697,6 +697,81 @@ async fn builtins_and_take_can_read_variables() {
 }
 
 #[tokio::test]
+async fn pipe_aggregators_transform_arrays() {
+    let source = r#"
+        gateway "api" { port: 8080 }
+
+        endpoint "GET /stats" {
+            let items = [
+                { "id": 2, "group": "b", "score": 5, "tags": ["x"] },
+                { "id": 1, "group": "a", "score": 3, "tags": ["a", "b"] },
+                { "id": 1, "group": "a", "score": 7, "tags": ["c"] }
+            ];
+            let sorted = items | sort(item => item.score) | map(item => item.id);
+            let paged = sorted | offset(1) | limit(2);
+            let groups = items | group_by(item => item.group);
+            let total = items | sum(item => item.score);
+            let average = items | avg(item => item.score);
+            let minimum = items | min(item => item.score);
+            let maximum = items | max(item => item.score);
+            let unique_ids = items | unique(item => item.id) | map(item => item.id);
+            let flat_tags = items | flat_map(item => item.tags);
+            let reduced = items | reduce(0, acc, item => acc + item.score);
+            let first_item = items | first();
+            let last_item = items | last();
+            let total_count = items | count();
+
+            respond 200 {
+                "sorted": sorted,
+                "paged": paged,
+                "groups": groups,
+                "total": total,
+                "average": average,
+                "minimum": minimum,
+                "maximum": maximum,
+                "unique_ids": unique_ids,
+                "flat_tags": flat_tags,
+                "reduced": reduced,
+                "first": first_item.id,
+                "last": last_item.id,
+                "count": total_count
+            }
+        }
+    "#;
+    let router = test_router(source);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/stats")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("route should respond");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("body should read");
+    let body: Value = serde_json::from_slice(&body).expect("body should be JSON");
+
+    assert_eq!(body["sorted"], json!([1.0, 2.0, 1.0]));
+    assert_eq!(body["paged"], json!([2.0, 1.0]));
+    assert_eq!(body["groups"]["a"].as_array().expect("group a").len(), 2);
+    assert_eq!(body["groups"]["b"].as_array().expect("group b").len(), 1);
+    assert_eq!(body["total"], 15.0);
+    assert_eq!(body["average"], 5.0);
+    assert_eq!(body["minimum"], 3.0);
+    assert_eq!(body["maximum"], 7.0);
+    assert_eq!(body["unique_ids"], json!([2.0, 1.0]));
+    assert_eq!(body["flat_tags"], json!(["x", "a", "b", "c"]));
+    assert_eq!(body["reduced"], 15.0);
+    assert_eq!(body["first"], 2.0);
+    assert_eq!(body["last"], 1.0);
+    assert_eq!(body["count"], 3);
+}
+
+#[tokio::test]
 async fn command_step_exposes_status_stdout_and_stderr() {
     let source = r#"
         gateway "api" { port: 8080 }

@@ -12,14 +12,16 @@ VeloGate - декларативный API gateway/BFF runtime. Он читает
 - JWT security по секрету HS256 и custom checks.
 - Basic authorization и custom checks.
 - `gateway.env_file` и `gateway.constants`, доступные всем endpoint-ам.
-- Pipe-операции над массивами: `filter`, `map`, `take`.
-- `take(...)` принимает выражение, например `take(default_take)`.
+- Pipe-операции над массивами: `filter`, `map`, `sort`, `limit`, `offset`, `group_by`, `reduce`, `count`, `sum`, `avg`, `min`, `max`, `unique`, `flat_map`, `first`, `last`, `take`.
+- `limit(...)`, `offset(...)` и `take(...)` принимают выражение, например `take(default_take)`.
+- `sync { ... }` принудительно разрывает execution layer и выполняет независимые шаги последовательно.
+- `command "..." as name;` запускает локальную shell-команду и возвращает `success`, `status`, `stdout`, `stderr`.
 - Built-in функции и методы для строк, массивов, проверок и форматирования.
 - SQL запросы через `db::query`.
 - gRPC unary calls, включая protobuf reflection через `.proto`.
 - Semantic validator до построения плана: обязательный порт, диапазоны статусов, HTTP methods, rate-limit units, дубликаты routes/constants/db/proto и существование env/proto файлов.
 - Planner проверяет неизвестные переменные, дубликаты и зависимости до старта runtime.
-- Dump/export AST, plan и graph.
+- Dump/export AST, plan, graph и OpenAPI 3.1.
 - CLI-команды `fmt`, `lint`, `routes`, `doctor`.
 - Structured logs через `tracing`.
 
@@ -280,7 +282,7 @@ respond 204
 
 Можно вернуть только тело и headers, только тело и cookies, только cookies/headers, или все вместе.
 
-## Pipe: filter, map, take
+## Pipe Operations
 
 ```rust
 let visible = users
@@ -292,9 +294,29 @@ let visible = users
     | take(default_take);
 ```
 
-`filter` принимает условие. `map` строит новый объект. `take` принимает любое выражение, которое вычисляется в неотрицательное целое число.
+`filter` принимает условие. `map` строит новое значение, обычно объект. `sort`, `group_by`, `sum`, `avg`, `min`, `max`, `unique` и `flat_map` принимают closure вида `item => expr`.
 
-Planner учитывает переменные внутри `filter`, `map`, `take`, secure checks, response и fetch config. Например `take(default_take)` корректно зависит от `default_take`.
+```rust
+let sorted = items | sort(item => item.score);
+let page = sorted | offset(10) | limit(20);
+let groups = items | group_by(item => item.group);
+let total = items | sum(item => item.score);
+let average = items | avg(item => item.score);
+let minimum = items | min(item => item.score);
+let maximum = items | max(item => item.score);
+let unique_ids = items | unique(item => item.id) | map(item => item.id);
+let tags = items | flat_map(item => item.tags);
+let reduced = items | reduce(0, acc, item => acc + item.score);
+let first_item = items | first();
+let last_item = items | last();
+let total_count = items | count();
+```
+
+`limit`, `offset` и `take` принимают любое выражение, которое вычисляется в неотрицательное целое число. `take` оставлен как alias/legacy-форма для `limit`.
+
+Planner учитывает переменные внутри pipe closure-ов, `limit`/`offset`/`take`, `reduce`, secure checks, response и fetch config. Например `take(default_take)` корректно зависит от `default_take`, а `item` и `acc` внутри pipe-операций считаются локальными переменными.
+
+Новые pipe-операции регистрируются через `pipe_ops!` в `src/ast.rs`. Этот macro генерирует AST variants, shape-kind enum-ы и builder-методы, а grammar использует только 4 формы операций: `closure`, `expr`, `none`, `reduce`.
 
 ## Built-in Функции И Методы
 
@@ -493,6 +515,8 @@ Run a local shell command with `command "..." as name;` or
 }
 ```
 
+On Windows `command` runs through `powershell -NoProfile -Command`. On Unix-like systems it runs through `sh -c`.
+
 Planner также отклоняет:
 
 - дубликаты переменных;
@@ -642,6 +666,18 @@ Export graph:
 cargo run -- dump --config examples/main.gate --format graph
 ```
 
+Export OpenAPI 3.1:
+
+```powershell
+cargo run -- dump --config examples/main.gate --format openapi
+```
+
+Сохранить OpenAPI JSON для Swagger UI:
+
+```powershell
+cargo run --quiet -- dump --config examples/main.gate --format openapi | Out-File -Encoding utf8 openapi.json
+```
+
 ## Примеры
 
 Основной пример:
@@ -656,6 +692,8 @@ cargo run -- dump --config examples/main.gate --format graph
 - `examples/cases/03_jwt_secure.gate` - JWT auth и checks.
 - `examples/cases/04_basic_env_constants.gate` - Basic auth, env, constants.
 - `examples/cases/05_builtins_and_variable_take.gate` - built-ins и `take(default_take)`.
+- `examples/cases/06_sync_and_command.gate` - `sync` sequencing и `command`.
+- `examples/cases/07_pipe_aggregators.gate` - полный набор pipe-операций и агрегаторов.
 
 Проверить все примеры можно через тест:
 

@@ -137,8 +137,55 @@ pub enum PipeOpExport {
     },
     Map {
         param: String,
-        layout: BTreeMap<String, ExprExport>,
+        value: ExprExport,
     },
+    Sort {
+        param: String,
+        key: ExprExport,
+    },
+    Limit {
+        count: ExprExport,
+    },
+    Offset {
+        count: ExprExport,
+    },
+    GroupBy {
+        param: String,
+        key: ExprExport,
+    },
+    Reduce {
+        initial: ExprExport,
+        acc: String,
+        param: String,
+        value: ExprExport,
+    },
+    Count,
+    Sum {
+        param: String,
+        value: ExprExport,
+    },
+    Avg {
+        param: String,
+        value: ExprExport,
+    },
+    Min {
+        param: String,
+        value: ExprExport,
+    },
+    Max {
+        param: String,
+        value: ExprExport,
+    },
+    Unique {
+        param: String,
+        key: ExprExport,
+    },
+    FlatMap {
+        param: String,
+        value: ExprExport,
+    },
+    First,
+    Last,
     Take {
         count: ExprExport,
     },
@@ -637,13 +684,62 @@ fn export_pipe_op(op: &PipeOp, interner: &Rodeo) -> PipeOpExport {
             param: sym(interner, *param),
             condition: export_expr(condition, interner),
         },
-        PipeOp::Map { param, layout } => PipeOpExport::Map {
+        PipeOp::Map { param, value } => PipeOpExport::Map {
             param: sym(interner, *param),
-            layout: layout
-                .iter()
-                .map(|(key, value)| (key.clone(), export_expr(value, interner)))
-                .collect(),
+            value: export_expr(value, interner),
         },
+        PipeOp::Sort { param, key } => PipeOpExport::Sort {
+            param: sym(interner, *param),
+            key: export_expr(key, interner),
+        },
+        PipeOp::Limit(count) => PipeOpExport::Limit {
+            count: export_expr(count, interner),
+        },
+        PipeOp::Offset(count) => PipeOpExport::Offset {
+            count: export_expr(count, interner),
+        },
+        PipeOp::GroupBy { param, key } => PipeOpExport::GroupBy {
+            param: sym(interner, *param),
+            key: export_expr(key, interner),
+        },
+        PipeOp::Reduce {
+            initial,
+            acc,
+            param,
+            value,
+        } => PipeOpExport::Reduce {
+            initial: export_expr(initial, interner),
+            acc: sym(interner, *acc),
+            param: sym(interner, *param),
+            value: export_expr(value, interner),
+        },
+        PipeOp::Count => PipeOpExport::Count,
+        PipeOp::Sum { param, value } => PipeOpExport::Sum {
+            param: sym(interner, *param),
+            value: export_expr(value, interner),
+        },
+        PipeOp::Avg { param, value } => PipeOpExport::Avg {
+            param: sym(interner, *param),
+            value: export_expr(value, interner),
+        },
+        PipeOp::Min { param, value } => PipeOpExport::Min {
+            param: sym(interner, *param),
+            value: export_expr(value, interner),
+        },
+        PipeOp::Max { param, value } => PipeOpExport::Max {
+            param: sym(interner, *param),
+            value: export_expr(value, interner),
+        },
+        PipeOp::Unique { param, key } => PipeOpExport::Unique {
+            param: sym(interner, *param),
+            key: export_expr(key, interner),
+        },
+        PipeOp::FlatMap { param, value } => PipeOpExport::FlatMap {
+            param: sym(interner, *param),
+            value: export_expr(value, interner),
+        },
+        PipeOp::First => PipeOpExport::First,
+        PipeOp::Last => PipeOpExport::Last,
         PipeOp::Take(count) => PipeOpExport::Take {
             count: export_expr(count, interner),
         },
@@ -721,21 +817,7 @@ fn step_var_and_deps(step: &Step, interner: &Rodeo) -> (String, Vec<String>) {
         } => {
             collect_expr_deps(source, interner, &mut deps);
             for op in operations {
-                match op {
-                    PipeOp::Filter { param, condition } => {
-                        let bound = sym(interner, *param);
-                        collect_expr_deps(condition, interner, &mut deps);
-                        deps.retain(|dep| dep != &bound);
-                    }
-                    PipeOp::Map { param, layout } => {
-                        let bound = sym(interner, *param);
-                        for expr in layout.values() {
-                            collect_expr_deps(expr, interner, &mut deps);
-                        }
-                        deps.retain(|dep| dep != &bound);
-                    }
-                    PipeOp::Take(count) => collect_expr_deps(count, interner, &mut deps),
-                }
+                collect_pipe_op_deps(op, interner, &mut deps);
             }
             sym(interner, *var_name)
         }
@@ -743,6 +825,52 @@ fn step_var_and_deps(step: &Step, interner: &Rodeo) -> (String, Vec<String>) {
     deps.sort();
     deps.dedup();
     (var, deps)
+}
+
+fn collect_pipe_op_deps(op: &PipeOp, interner: &Rodeo, deps: &mut Vec<String>) {
+    match op {
+        PipeOp::Filter { param, condition } => {
+            collect_bound_expr_deps(*param, condition, interner, deps)
+        }
+        PipeOp::Map { param, value }
+        | PipeOp::Sort { param, key: value }
+        | PipeOp::GroupBy { param, key: value }
+        | PipeOp::Sum { param, value }
+        | PipeOp::Avg { param, value }
+        | PipeOp::Min { param, value }
+        | PipeOp::Max { param, value }
+        | PipeOp::Unique { param, key: value }
+        | PipeOp::FlatMap { param, value } => {
+            collect_bound_expr_deps(*param, value, interner, deps);
+        }
+        PipeOp::Reduce {
+            initial,
+            acc,
+            param,
+            value,
+        } => {
+            collect_expr_deps(initial, interner, deps);
+            collect_expr_deps(value, interner, deps);
+            let acc = sym(interner, *acc);
+            let param = sym(interner, *param);
+            deps.retain(|dep| dep != &acc && dep != &param);
+        }
+        PipeOp::Take(count) | PipeOp::Limit(count) | PipeOp::Offset(count) => {
+            collect_expr_deps(count, interner, deps);
+        }
+        PipeOp::Count | PipeOp::First | PipeOp::Last => {}
+    }
+}
+
+fn collect_bound_expr_deps(
+    param: Sym,
+    expr: &Expression,
+    interner: &Rodeo,
+    deps: &mut Vec<String>,
+) {
+    collect_expr_deps(expr, interner, deps);
+    let bound = sym(interner, param);
+    deps.retain(|dep| dep != &bound);
 }
 
 fn collect_expr_deps(expr: &Expression, interner: &Rodeo, deps: &mut Vec<String>) {

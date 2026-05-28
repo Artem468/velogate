@@ -128,17 +128,178 @@ pub struct DbQueryConfig {
     pub fallback: Option<Expression>,
 }
 
-#[derive(Debug, Clone)]
-pub enum PipeOp {
-    Filter {
-        param: Sym,
-        condition: Expression,
-    },
-    Map {
-        param: Sym,
-        layout: HashMap<String, Expression>,
-    },
-    Take(Expression),
+macro_rules! pipe_ops {
+    ($dispatch:ident) => {
+        $dispatch! {
+            closure {
+                filter => Filter(condition),
+                map => Map(value),
+                sort => Sort(key),
+                group_by => GroupBy(key),
+                sum => Sum(value),
+                avg => Avg(value),
+                min => Min(value),
+                max => Max(value),
+                unique => Unique(key),
+                flat_map => FlatMap(value),
+            }
+            expr {
+                limit => Limit,
+                offset => Offset,
+                take => Take,
+            }
+            none {
+                count => Count,
+                first => First,
+                last => Last,
+            }
+            reduce {
+                reduce => Reduce(value),
+            }
+        }
+    };
+}
+
+macro_rules! declare_pipe_ops {
+    (
+        closure { $($closure_name:ident => $closure_variant:ident($closure_field:ident),)* }
+        expr { $($expr_name:ident => $expr_variant:ident,)* }
+        none { $($none_name:ident => $none_variant:ident,)* }
+        reduce { $($reduce_name:ident => $reduce_variant:ident($reduce_field:ident),)* }
+    ) => {
+        #[derive(Debug, Clone)]
+        pub enum PipeOp {
+            $(
+                $closure_variant {
+                    param: Sym,
+                    $closure_field: Expression,
+                },
+            )*
+            $($expr_variant(Expression),)*
+            $($none_variant,)*
+            $(
+                $reduce_variant {
+                    initial: Expression,
+                    acc: Sym,
+                    param: Sym,
+                    $reduce_field: Expression,
+                },
+            )*
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum PipeClosureOp {
+            $($closure_variant,)*
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum PipeExprOp {
+            $($expr_variant,)*
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum PipeNoneOp {
+            $($none_variant,)*
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum PipeReduceOp {
+            $($reduce_variant,)*
+        }
+
+        impl PipeClosureOp {
+            pub fn from_keyword(name: &str) -> Option<Self> {
+                match name {
+                    $(stringify!($closure_name) => Some(Self::$closure_variant),)*
+                    _ => None,
+                }
+            }
+
+            pub fn build(self, param: Sym, value: Expression) -> PipeOp {
+                match self {
+                    $(Self::$closure_variant => PipeOp::$closure_variant { param, $closure_field: value },)*
+                }
+            }
+        }
+
+        impl PipeExprOp {
+            pub fn from_keyword(name: &str) -> Option<Self> {
+                match name {
+                    $(stringify!($expr_name) => Some(Self::$expr_variant),)*
+                    _ => None,
+                }
+            }
+
+            pub fn build(self, value: Expression) -> PipeOp {
+                match self {
+                    $(Self::$expr_variant => PipeOp::$expr_variant(value),)*
+                }
+            }
+        }
+
+        impl PipeNoneOp {
+            pub fn from_keyword(name: &str) -> Option<Self> {
+                match name {
+                    $(stringify!($none_name) => Some(Self::$none_variant),)*
+                    _ => None,
+                }
+            }
+
+            pub fn build(self) -> PipeOp {
+                match self {
+                    $(Self::$none_variant => PipeOp::$none_variant,)*
+                }
+            }
+        }
+
+        impl PipeReduceOp {
+            pub fn from_keyword(name: &str) -> Option<Self> {
+                match name {
+                    $(stringify!($reduce_name) => Some(Self::$reduce_variant),)*
+                    _ => None,
+                }
+            }
+
+            pub fn build(self, initial: Expression, acc: Sym, param: Sym, value: Expression) -> PipeOp {
+                match self {
+                    $(Self::$reduce_variant => PipeOp::$reduce_variant { initial, acc, param, $reduce_field: value },)*
+                }
+            }
+        }
+
+        impl PipeOp {
+            pub fn registered_ops() -> &'static [(&'static str, &'static str)] {
+                &[
+                    $((stringify!($closure_name), "closure"),)*
+                    $((stringify!($expr_name), "expr"),)*
+                    $((stringify!($none_name), "none"),)*
+                    $((stringify!($reduce_name), "expr_reduce_closure"),)*
+                ]
+            }
+        }
+    };
+}
+
+pipe_ops!(declare_pipe_ops);
+
+impl PipeOp {
+    pub fn shape_name(&self) -> &'static str {
+        match self {
+            Self::Filter { .. }
+            | Self::Map { .. }
+            | Self::Sort { .. }
+            | Self::GroupBy { .. }
+            | Self::Sum { .. }
+            | Self::Avg { .. }
+            | Self::Min { .. }
+            | Self::Max { .. }
+            | Self::Unique { .. }
+            | Self::FlatMap { .. } => "closure",
+            Self::Limit(_) | Self::Offset(_) | Self::Take(_) => "expr",
+            Self::Count | Self::First | Self::Last => "none",
+            Self::Reduce { .. } => "expr_reduce_closure",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

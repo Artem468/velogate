@@ -1,6 +1,6 @@
 use crate::ast::{
     BinaryOperator, DbQueryConfig, Endpoint, Expression, FileAST, GrpcConfig, HttpConfig, PipeOp,
-    Step,
+    Step, Sym,
 };
 use crate::planner::ExecutionPlan;
 use axum::body::{Body, Bytes};
@@ -18,7 +18,8 @@ use serde_json::{Map, json};
 use sqlx::any::{AnyPoolOptions, install_default_drivers};
 use sqlx::{AnyPool, Column, Row, TypeInfo};
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -806,30 +807,173 @@ fn execute_pipe(
                 }
                 current = Value::Array(filtered);
             }
-            PipeOp::Map { param, layout } => {
+            PipeOp::Map { param, value } => {
                 let items = take_array(current, "map")?;
                 let mut mapped = Vec::with_capacity(items.len());
                 let mut scoped = vars.clone();
                 for item in items {
                     scoped.insert(*param, item);
-                    let mut object = Map::new();
-                    for (key, expr) in layout {
-                        object.insert(key.clone(), eval_expr(expr, &scoped, interner)?);
-                    }
-                    mapped.push(Value::Object(object));
+                    mapped.push(eval_expr(value, &scoped, interner)?);
                 }
                 current = Value::Array(mapped);
             }
-            PipeOp::Take(count) => {
-                let mut items = take_array(current, "take")?;
+            PipeOp::Sort { param, key } => {
+                let items = take_array(current, "sort")?;
+                let mut keyed = Vec::with_capacity(items.len());
+                let mut scoped = vars.clone();
+                for item in items {
+                    scoped.insert(*param, item.clone());
+                    keyed.push((eval_expr(key, &scoped, interner)?, item));
+                }
+                keyed.sort_by(|(left, _), (right, _)| compare_json(left, right));
+                current = Value::Array(keyed.into_iter().map(|(_, item)| item).collect());
+            }
+            PipeOp::Limit(count) | PipeOp::Take(count) => {
+                let mut items = take_array(current, "limit")?;
                 let count = as_usize(eval_expr(count, vars, interner)?)?;
                 items.truncate(count);
                 current = Value::Array(items);
+            }
+            PipeOp::Offset(count) => {
+                let items = take_array(current, "offset")?;
+                let count = as_usize(eval_expr(count, vars, interner)?)?;
+                current = Value::Array(items.into_iter().skip(count).collect());
+            }
+            PipeOp::GroupBy { param, key } => {
+                let mut groups = Map::new();
+                let mut scoped = vars.clone();
+                for item in take_array(current, "group_by")? {
+                    scoped.insert(*param, item.clone());
+                    let key = as_string(eval_expr(key, &scoped, interner)?);
+                    groups
+                        .entry(key)
+                        .or_insert_with(|| Value::Array(Vec::new()))
+                        .as_array_mut()
+                        .expect("group bucket should be array")
+                        .push(item);
+                }
+                current = Value::Object(groups);
+            }
+            PipeOp::Reduce {
+                initial,
+                acc,
+                param,
+                value,
+            } => {
+                let mut acc_value = eval_expr(initial, vars, interner)?;
+                let mut scoped = vars.clone();
+                for item in take_array(current, "reduce")? {
+                    scoped.insert(*acc, acc_value);
+                    scoped.insert(*param, item);
+                    acc_value = eval_expr(value, &scoped, interner)?;
+                }
+                current = acc_value;
+            }
+            PipeOp::Count => current = json!(take_array(current, "count")?.len()),
+            PipeOp::Sum { param, value } => {
+                current = json!(
+                    numeric_values(take_array(current, "sum")?, *param, value, vars, interner)?
+                        .into_iter()
+                        .sum::<f64>()
+                );
+            }
+            PipeOp::Avg { param, value } => {
+                let values =
+                    numeric_values(take_array(current, "avg")?, *param, value, vars, interner)?;
+                current = json!(if values.is_empty() {
+                    0.0
+                } else {
+                    values.iter().sum::<f64>() / values.len() as f64
+                });
+            }
+            PipeOp::Min { param, value } => {
+                let values =
+                    numeric_values(take_array(current, "min")?, *param, value, vars, interner)?;
+                current = values
+                    .into_iter()
+                    .reduce(f64::min)
+                    .map_or(Value::Null, |value| json!(value));
+            }
+            PipeOp::Max { param, value } => {
+                let values =
+                    numeric_values(take_array(current, "max")?, *param, value, vars, interner)?;
+                current = values
+                    .into_iter()
+                    .reduce(f64::max)
+                    .map_or(Value::Null, |value| json!(value));
+            }
+            PipeOp::Unique { param, key } => {
+                let mut seen = BTreeSet::<String>::new();
+                let mut unique = Vec::new();
+                let mut scoped = vars.clone();
+                for item in take_array(current, "unique")? {
+                    scoped.insert(*param, item.clone());
+                    let key = eval_expr(key, &scoped, interner)?;
+                    let key = serde_json::to_string(&key).map_err(|err| {
+                        RuntimeError::Execution(format!("failed to serialize unique key: {err}"))
+                    })?;
+                    if seen.insert(key) {
+                        unique.push(item);
+                    }
+                }
+                current = Value::Array(unique);
+            }
+            PipeOp::FlatMap { param, value } => {
+                let mut flattened = Vec::new();
+                let mut scoped = vars.clone();
+                for item in take_array(current, "flat_map")? {
+                    scoped.insert(*param, item);
+                    match eval_expr(value, &scoped, interner)? {
+                        Value::Array(items) => flattened.extend(items),
+                        value => flattened.push(value),
+                    }
+                }
+                current = Value::Array(flattened);
+            }
+            PipeOp::First => {
+                current = take_array(current, "first")?
+                    .into_iter()
+                    .next()
+                    .unwrap_or(Value::Null);
+            }
+            PipeOp::Last => {
+                current = take_array(current, "last")?
+                    .into_iter()
+                    .last()
+                    .unwrap_or(Value::Null);
             }
         }
     }
 
     Ok(current)
+}
+
+fn numeric_values(
+    items: Vec<Value>,
+    param: Sym,
+    expr: &Expression,
+    vars: &Vars,
+    interner: &Rodeo,
+) -> RuntimeResult<Vec<f64>> {
+    let mut values = Vec::with_capacity(items.len());
+    let mut scoped = vars.clone();
+    for item in items {
+        scoped.insert(param, item);
+        values.push(as_f64(&eval_expr(expr, &scoped, interner)?)?);
+    }
+    Ok(values)
+}
+
+fn compare_json(left: &Value, right: &Value) -> Ordering {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => left
+            .as_f64()
+            .partial_cmp(&right.as_f64())
+            .unwrap_or(Ordering::Equal),
+        (Value::String(left), Value::String(right)) => left.cmp(right),
+        (Value::Bool(left), Value::Bool(right)) => left.cmp(right),
+        _ => as_string(left.clone()).cmp(&as_string(right.clone())),
+    }
 }
 
 fn eval_response(

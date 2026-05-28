@@ -323,25 +323,48 @@ fn step_reads(step: &Step) -> BTreeSet<Sym> {
         } => {
             collect_expr_reads(source, &mut reads, &BTreeSet::new());
             for op in operations {
-                match op {
-                    PipeOp::Filter { param, condition } => {
-                        let mut bound = BTreeSet::new();
-                        bound.insert(*param);
-                        collect_expr_reads(condition, &mut reads, &bound);
-                    }
-                    PipeOp::Map { param, layout } => {
-                        let mut bound = BTreeSet::new();
-                        bound.insert(*param);
-                        for expr in layout.values() {
-                            collect_expr_reads(expr, &mut reads, &bound);
-                        }
-                    }
-                    PipeOp::Take(count) => collect_expr_reads(count, &mut reads, &BTreeSet::new()),
-                }
+                collect_pipe_op_reads(op, &mut reads);
             }
         }
     }
     reads
+}
+
+fn collect_pipe_op_reads(op: &PipeOp, reads: &mut BTreeSet<Sym>) {
+    match op {
+        PipeOp::Filter { param, condition } => collect_bound_expr_reads(*param, condition, reads),
+        PipeOp::Map { param, value }
+        | PipeOp::Sort { param, key: value }
+        | PipeOp::GroupBy { param, key: value }
+        | PipeOp::Sum { param, value }
+        | PipeOp::Avg { param, value }
+        | PipeOp::Min { param, value }
+        | PipeOp::Max { param, value }
+        | PipeOp::Unique { param, key: value }
+        | PipeOp::FlatMap { param, value } => collect_bound_expr_reads(*param, value, reads),
+        PipeOp::Reduce {
+            initial,
+            acc,
+            param,
+            value,
+        } => {
+            collect_expr_reads(initial, reads, &BTreeSet::new());
+            let mut bound = BTreeSet::new();
+            bound.insert(*acc);
+            bound.insert(*param);
+            collect_expr_reads(value, reads, &bound);
+        }
+        PipeOp::Take(count) | PipeOp::Limit(count) | PipeOp::Offset(count) => {
+            collect_expr_reads(count, reads, &BTreeSet::new());
+        }
+        PipeOp::Count | PipeOp::First | PipeOp::Last => {}
+    }
+}
+
+fn collect_bound_expr_reads(param: Sym, expr: &Expression, reads: &mut BTreeSet<Sym>) {
+    let mut bound = BTreeSet::new();
+    bound.insert(param);
+    collect_expr_reads(expr, reads, &bound);
 }
 
 fn response_reads(endpoint: &Endpoint) -> BTreeSet<Sym> {

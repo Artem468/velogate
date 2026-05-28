@@ -252,10 +252,24 @@ IdentLike: String = {
     "constants" => "constants".to_string(),
     "command" => "command".to_string(),
     "sync" => "sync".to_string(),
+    "sort" => "sort".to_string(),
+    "limit" => "limit".to_string(),
+    "offset" => "offset".to_string(),
+    "group_by" => "group_by".to_string(),
+    "reduce" => "reduce".to_string(),
+    "count" => "count".to_string(),
+    "sum" => "sum".to_string(),
+    "avg" => "avg".to_string(),
+    "min" => "min".to_string(),
+    "max" => "max".to_string(),
+    "unique" => "unique".to_string(),
+    "flat_map" => "flat_map".to_string(),
+    "first" => "first".to_string(),
+    "last" => "last".to_string(),
 };
 
 Step: Step = {
-    "fetch" <url:Expression> "as" <var:Ident> <cfg:FetchConfigBlock?> ";" => {
+    "fetch" <url:Expression> "as" <var:IdentLike> <cfg:FetchConfigBlock?> ";" => {
         let cfg = cfg.unwrap_or_default();
         Step::FetchHttp {
             var_name: interner.get_or_intern(&var),
@@ -270,7 +284,7 @@ Step: Step = {
             }
         }
     },
-    "let" <var:Ident> "=" "fetch" <url:Expression> <cfg:FetchConfigBlock?> ";" => {
+    "let" <var:IdentLike> "=" "fetch" <url:Expression> <cfg:FetchConfigBlock?> ";" => {
         let cfg = cfg.unwrap_or_default();
         Step::FetchHttp {
             var_name: interner.get_or_intern(&var),
@@ -285,19 +299,19 @@ Step: Step = {
             }
         }
     },
-    "command" <command:String> "as" <var:Ident> ";" => {
+    "command" <command:String> "as" <var:IdentLike> ";" => {
         Step::Command {
             var_name: interner.get_or_intern(&var),
             command,
         }
     },
-    "let" <var:Ident> "=" "command" <command:String> ";" => {
+    "let" <var:IdentLike> "=" "command" <command:String> ";" => {
         Step::Command {
             var_name: interner.get_or_intern(&var),
             command,
         }
     },
-    "let" <var:Ident> "=" "db" "::" "query" "(" <db_source:Expression> "," <sql:String> <params:DbQueryParams> ")" <cfg:FetchConfigBlock?> ";" => {
+    "let" <var:IdentLike> "=" "db" "::" "query" "(" <db_source:Expression> "," <sql:String> <params:DbQueryParams> ")" <cfg:FetchConfigBlock?> ";" => {
         let cfg = cfg.unwrap_or_default();
         Step::QueryDb {
             var_name: interner.get_or_intern(&var),
@@ -310,7 +324,7 @@ Step: Step = {
             }
         }
     },
-    "let" <var:Ident> "=" "grpc" "::" "call" "(" <target:String> "," <proto_path:String> "," <service:String> "," <method:String> "," <payload:Expression> ")" <cfg:FetchConfigBlock?> ";" => {
+    "let" <var:IdentLike> "=" "grpc" "::" "call" "(" <target:String> "," <proto_path:String> "," <service:String> "," <method:String> "," <payload:Expression> ")" <cfg:FetchConfigBlock?> ";" => {
         let cfg = cfg.unwrap_or_default();
         Step::CallGrpc {
             var_name: interner.get_or_intern(&var),
@@ -325,7 +339,7 @@ Step: Step = {
             }
         }
     },
-    "let" <var:Ident> "=" "grpc" "::" "call" "(" <service_method:String> "," <payload:Expression> ")" <cfg:FetchConfigBlock?> ";" => {
+    "let" <var:IdentLike> "=" "grpc" "::" "call" "(" <service_method:String> "," <payload:Expression> ")" <cfg:FetchConfigBlock?> ";" => {
         let cfg = cfg.unwrap_or_default();
         Step::CallGrpc {
             var_name: interner.get_or_intern(&var),
@@ -340,14 +354,14 @@ Step: Step = {
             }
         }
     },
-    "let" <var:Ident> "=" <source:Expression> <operations:PipeOp+> ";" => {
+    "let" <var:IdentLike> "=" <source:Expression> <operations:PipeOp+> ";" => {
         Step::Pipe {
             var_name: interner.get_or_intern(&var),
             source,
             operations,
         }
     },
-    "let" <var:Ident> "=" <value:Expression> ";" => {
+    "let" <var:IdentLike> "=" <value:Expression> ";" => {
         Step::Let {
             var_name: interner.get_or_intern(&var),
             value,
@@ -366,19 +380,48 @@ DbQueryParams: Vec<Expression> = {
 };
 
 PipeOp: PipeOp = {
-    "|" "filter" "(" <param:Ident> "=>" <condition:Expression> ")" => {
-        PipeOp::Filter {
-            param: interner.get_or_intern(&param),
-            condition,
-        }
+    "|" <op:PipeClosureOp> "(" <param:IdentLike> "=>" <value:Expression> ")" => {
+        op.build(interner.get_or_intern(&param), value)
     },
-    "|" "map" "(" <param:Ident> "=>" "{" <layout:ResponseObject> "}" ")" => {
-        PipeOp::Map {
-            param: interner.get_or_intern(&param),
-            layout,
-        }
+    "|" <op:PipeExprOp> "(" <value:Expression> ")" => op.build(value),
+    "|" <op:PipeNoneOp> "(" ")" => op.build(),
+    "|" <op:PipeReduceOp> "(" <initial:Expression> "," <acc:IdentLike> "," <param:IdentLike> "=>" <value:Expression> ")" => {
+        op.build(
+            initial,
+            interner.get_or_intern(&acc),
+            interner.get_or_intern(&param),
+            value,
+        )
     },
-    "|" "take" "(" <count:Expression> ")" => PipeOp::Take(count),
+};
+
+PipeClosureOp: PipeClosureOp = {
+    "filter" => PipeClosureOp::from_keyword("filter").unwrap(),
+    "map" => PipeClosureOp::from_keyword("map").unwrap(),
+    "sort" => PipeClosureOp::from_keyword("sort").unwrap(),
+    "group_by" => PipeClosureOp::from_keyword("group_by").unwrap(),
+    "sum" => PipeClosureOp::from_keyword("sum").unwrap(),
+    "avg" => PipeClosureOp::from_keyword("avg").unwrap(),
+    "min" => PipeClosureOp::from_keyword("min").unwrap(),
+    "max" => PipeClosureOp::from_keyword("max").unwrap(),
+    "unique" => PipeClosureOp::from_keyword("unique").unwrap(),
+    "flat_map" => PipeClosureOp::from_keyword("flat_map").unwrap(),
+};
+
+PipeExprOp: PipeExprOp = {
+    "limit" => PipeExprOp::from_keyword("limit").unwrap(),
+    "offset" => PipeExprOp::from_keyword("offset").unwrap(),
+    "take" => PipeExprOp::from_keyword("take").unwrap(),
+};
+
+PipeNoneOp: PipeNoneOp = {
+    "count" => PipeNoneOp::from_keyword("count").unwrap(),
+    "first" => PipeNoneOp::from_keyword("first").unwrap(),
+    "last" => PipeNoneOp::from_keyword("last").unwrap(),
+};
+
+PipeReduceOp: PipeReduceOp = {
+    "reduce" => PipeReduceOp::from_keyword("reduce").unwrap(),
 };
 
 FetchConfigBlock: TailConfig = {
@@ -563,6 +606,20 @@ extern {
         "filter" => Token::Filter,
         "map" => Token::Map,
         "take" => Token::Take,
+        "sort" => Token::Sort,
+        "limit" => Token::Limit,
+        "offset" => Token::Offset,
+        "group_by" => Token::GroupBy,
+        "reduce" => Token::Reduce,
+        "count" => Token::Count,
+        "sum" => Token::Sum,
+        "avg" => Token::Avg,
+        "min" => Token::Min,
+        "max" => Token::Max,
+        "unique" => Token::Unique,
+        "flat_map" => Token::FlatMap,
+        "first" => Token::First,
+        "last" => Token::Last,
         "sync" => Token::Sync,
         "window" => Token::Window,
         "true" => Token::True,

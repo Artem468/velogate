@@ -244,24 +244,47 @@ fn collect_step_reads(step: &Step, reads: &mut HashSet<Sym>) {
         } => {
             collect_expr_reads(source, reads, &HashSet::new());
             for op in operations {
-                match op {
-                    PipeOp::Filter { param, condition } => {
-                        let mut bound = HashSet::new();
-                        bound.insert(*param);
-                        collect_expr_reads(condition, reads, &bound);
-                    }
-                    PipeOp::Map { param, layout } => {
-                        let mut bound = HashSet::new();
-                        bound.insert(*param);
-                        for expr in layout.values() {
-                            collect_expr_reads(expr, reads, &bound);
-                        }
-                    }
-                    PipeOp::Take(count) => collect_expr_reads(count, reads, &HashSet::new()),
-                }
+                collect_pipe_op_reads(op, reads);
             }
         }
     }
+}
+
+fn collect_pipe_op_reads(op: &PipeOp, reads: &mut HashSet<Sym>) {
+    match op {
+        PipeOp::Filter { param, condition } => collect_bound_expr_reads(*param, condition, reads),
+        PipeOp::Map { param, value }
+        | PipeOp::Sort { param, key: value }
+        | PipeOp::GroupBy { param, key: value }
+        | PipeOp::Sum { param, value }
+        | PipeOp::Avg { param, value }
+        | PipeOp::Min { param, value }
+        | PipeOp::Max { param, value }
+        | PipeOp::Unique { param, key: value }
+        | PipeOp::FlatMap { param, value } => collect_bound_expr_reads(*param, value, reads),
+        PipeOp::Reduce {
+            initial,
+            acc,
+            param,
+            value,
+        } => {
+            collect_expr_reads(initial, reads, &HashSet::new());
+            let mut bound = HashSet::new();
+            bound.insert(*acc);
+            bound.insert(*param);
+            collect_expr_reads(value, reads, &bound);
+        }
+        PipeOp::Take(count) | PipeOp::Limit(count) | PipeOp::Offset(count) => {
+            collect_expr_reads(count, reads, &HashSet::new());
+        }
+        PipeOp::Count | PipeOp::First | PipeOp::Last => {}
+    }
+}
+
+fn collect_bound_expr_reads(param: Sym, expr: &Expression, reads: &mut HashSet<Sym>) {
+    let mut bound = HashSet::new();
+    bound.insert(param);
+    collect_expr_reads(expr, reads, &bound);
 }
 
 fn collect_optional_expr_reads(
