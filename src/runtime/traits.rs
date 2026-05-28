@@ -97,7 +97,13 @@ impl fmt::Display for RuntimeError {
             Self::InvalidBindAddress(addr) => write!(f, "invalid bind address `{addr}`"),
             Self::Bind(err) => write!(f, "failed to bind listener: {err}"),
             Self::Serve(err) => write!(f, "server failed: {err}"),
-            Self::Execution(message) => f.write_str(message),
+            Self::BadRequest(message)
+            | Self::Upstream(message)
+            | Self::Timeout(message)
+            | Self::Database(message)
+            | Self::Grpc(message)
+            | Self::Config(message)
+            | Self::Execution(message) => f.write_str(message),
         }
     }
 }

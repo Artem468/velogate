@@ -321,7 +321,15 @@ fn step_reads(step: &Step) -> BTreeSet<Sym> {
 
 fn response_reads(endpoint: &Endpoint) -> BTreeSet<Sym> {
     let mut reads = BTreeSet::new();
-    for expr in endpoint.response_body.values() {
+    if let Some(body) = &endpoint.response.body {
+        for expr in body.values() {
+            collect_expr_reads(expr, &mut reads, &BTreeSet::new());
+        }
+    }
+    for expr in endpoint.response.headers.values() {
+        collect_expr_reads(expr, &mut reads, &BTreeSet::new());
+    }
+    for expr in endpoint.response.cookies.values() {
         collect_expr_reads(expr, &mut reads, &BTreeSet::new());
     }
     reads

@@ -1,6 +1,7 @@
 use axum::body::Body;
 use axum::http::Request;
 use axum::response::Response;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use tokio::time::Instant;
 pub(crate) struct RateLimitPolicy {
     pub(super) limit: u32,
     pub(super) window: Duration,
-    pub(super) state: Arc<Mutex<RateLimitState>>,
+    pub(super) states: Arc<Mutex<HashMap<String, RateLimitState>>>,
 }
 
 pub(crate) struct RateLimitState {

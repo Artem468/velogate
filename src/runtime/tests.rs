@@ -2,6 +2,7 @@ use super::Runtime;
 use crate::parser::Parser;
 use crate::planner::build_plan;
 use axum::body::to_bytes;
+use axum::http::header::SET_COOKIE;
 use axum::http::{Request, StatusCode};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -357,6 +358,138 @@ async fn rate_limit_endpoint_returns_429_after_limit() {
         .await
         .expect("route should respond");
     assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn rate_limit_is_tracked_per_client_ip() {
+    let source = r#"
+            gateway "test" { port: 0 }
+
+            endpoint "GET /limited" {
+                rate_limit: 1/rps window 1s,
+                respond 200 { "ok": true }
+            }
+        "#;
+
+    let router = test_router(source);
+
+    let first = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/limited")
+                .header("x-real-ip", "10.0.0.1")
+                .body(axum::body::Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("route should respond");
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let same_ip = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/limited")
+                .header("x-real-ip", "10.0.0.1")
+                .body(axum::body::Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("route should respond");
+    assert_eq!(same_ip.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let other_ip = router
+        .oneshot(
+            Request::builder()
+                .uri("/limited")
+                .header("x-real-ip", "10.0.0.2")
+                .body(axum::body::Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("route should respond");
+    assert_eq!(other_ip.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn response_can_set_body_headers_and_cookies() {
+    let source = r#"
+            gateway "test" { port: 0 }
+
+            endpoint "GET /response" {
+                let token = "abc123";
+
+                respond 202
+                    headers { "x-trace-id": token }
+                    cookies { "session": token }
+                    body { "status": "ok", "token": token }
+            }
+        "#;
+
+    let router = test_router(source);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/response")
+                .body(axum::body::Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("route should respond");
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-trace-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("abc123")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(SET_COOKIE)
+            .and_then(|v| v.to_str().ok()),
+        Some("session=abc123; Path=/")
+    );
+
+    let body = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("body should read");
+    let actual: Value = serde_json::from_slice(&body).expect("body should be JSON");
+    assert_eq!(actual, json!({ "status": "ok", "token": "abc123" }));
+}
+
+#[tokio::test]
+async fn response_can_return_status_without_body() {
+    let source = r#"
+            gateway "test" { port: 0 }
+
+            endpoint "DELETE /empty" {
+                respond 204
+            }
+        "#;
+
+    let router = test_router(source);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/empty")
+                .body(axum::body::Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("route should respond");
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let body = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("body should read");
+    assert!(body.is_empty());
 }
 
 #[tokio::test]

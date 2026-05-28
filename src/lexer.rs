@@ -71,6 +71,10 @@ pub(crate) enum Token {
     Method,
     #[token("body")]
     Body,
+    #[token("headers")]
+    Headers,
+    #[token("cookies")]
+    Cookies,
 
     #[token("filter")]
     Filter,

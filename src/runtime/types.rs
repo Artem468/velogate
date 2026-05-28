@@ -28,6 +28,12 @@ pub enum RuntimeError {
     InvalidBindAddress(String),
     Bind(std::io::Error),
     Serve(std::io::Error),
+    BadRequest(String),
+    Upstream(String),
+    Timeout(String),
+    Database(String),
+    Grpc(String),
+    Config(String),
     Execution(String),
 }
 

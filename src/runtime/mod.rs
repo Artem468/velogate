@@ -3,8 +3,9 @@ use crate::ast::{
     Step,
 };
 use crate::planner::ExecutionPlan;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query};
+use axum::http::header::{HeaderName, HeaderValue, SET_COOKIE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::on;
@@ -26,6 +27,7 @@ use tokio::task::JoinSet;
 use tonic::client::Grpc;
 use tonic::transport::{Channel, Endpoint as TonicEndpoint};
 use tonic_prost::ProstCodec;
+use tracing::{debug, error, info, warn};
 
 mod functions;
 mod rate_limit;
@@ -44,6 +46,12 @@ use types::{
     Value, Vars,
 };
 pub use types::{Runtime, RuntimeError};
+
+struct EvaluatedResponse {
+    body: Option<Value>,
+    headers: HeaderMap,
+    cookies: Vec<String>,
+}
 
 impl Runtime {
     pub fn new(ast: FileAST, interner: Rodeo, plan: ExecutionPlan) -> Self {
@@ -79,10 +87,13 @@ impl Runtime {
             .await
             .map_err(RuntimeError::Bind)?;
 
-        println!("velogate listening on http://{addr}");
-        axum::serve(listener, router)
-            .await
-            .map_err(RuntimeError::Serve)
+        info!(%addr, "velogate listening");
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .map_err(RuntimeError::Serve)
     }
 
     pub fn router(&self) -> RuntimeResult<Router> {
@@ -152,6 +163,8 @@ impl EndpointRuntime {
         headers: HeaderMap,
         body: Value,
     ) -> Response {
+        let endpoint = format!("{} {}", self.endpoint.method, self.endpoint.path);
+        debug!(%endpoint, "handling request");
         let mut vars = self.static_vars.clone();
         vars.extend(request_vars(
             &path_params,
@@ -162,6 +175,7 @@ impl EndpointRuntime {
         ));
 
         if let Err(err) = authorize_endpoint(&self.endpoint, &mut vars, &headers, &self.interner) {
+            warn!(%endpoint, message = %err.message, "request rejected by security rule");
             let body = json!({
                 "error": "unauthorized",
                 "message": err.message,
@@ -170,22 +184,42 @@ impl EndpointRuntime {
         }
 
         match self.execute(vars).await {
-            Ok(value) => {
+            Ok(evaluated) => {
                 let status =
-                    StatusCode::from_u16(self.endpoint.response_status).unwrap_or(StatusCode::OK);
-                (status, Json(value)).into_response()
+                    StatusCode::from_u16(self.endpoint.response.status).unwrap_or(StatusCode::OK);
+                let mut response = if let Some(body) = evaluated.body {
+                    (status, Json(body)).into_response()
+                } else {
+                    let mut response = Response::new(Body::empty());
+                    *response.status_mut() = status;
+                    response
+                };
+                response.headers_mut().extend(evaluated.headers);
+                for cookie in evaluated.cookies {
+                    match HeaderValue::from_str(&cookie) {
+                        Ok(value) => {
+                            response.headers_mut().append(SET_COOKIE, value);
+                        }
+                        Err(err) => {
+                            error!(%endpoint, %err, cookie, "failed to append response cookie")
+                        }
+                    }
+                }
+                response
             }
             Err(err) => {
+                let status = error_status(&err);
+                error!(%endpoint, %status, error = %err, "request failed");
                 let body = json!({
-                    "error": "runtime_error",
+                    "error": error_code(&err),
                     "message": err.to_string(),
                 });
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response()
+                (status, Json(body)).into_response()
             }
         }
     }
 
-    async fn execute(&self, mut vars: Vars) -> RuntimeResult<Value> {
+    async fn execute(&self, mut vars: Vars) -> RuntimeResult<EvaluatedResponse> {
         for layer in &self.plan.layers {
             if let [step_idx] = layer.as_slice() {
                 let step = self.endpoint.steps.get(*step_idx).ok_or_else(|| {
@@ -198,6 +232,11 @@ impl EndpointRuntime {
                     proto_paths: &self.proto_paths,
                     proto_pools: &self.proto_pools,
                 };
+                debug!(
+                    step = step_idx,
+                    var = sym(&self.interner, step.var_name()),
+                    "executing step"
+                );
                 let value = execute_step(step, &vars, &self.interner, &deps).await?;
                 vars.insert(step.var_name(), value);
                 continue;
@@ -207,6 +246,7 @@ impl EndpointRuntime {
             let mut tasks = JoinSet::new();
 
             for step_idx in layer {
+                let step_idx_value = *step_idx;
                 let step = self.endpoint.steps.get(*step_idx).ok_or_else(|| {
                     RuntimeError::Execution(format!("missing step {step_idx} in endpoint plan"))
                 })?;
@@ -228,6 +268,11 @@ impl EndpointRuntime {
                         proto_paths: &proto_paths,
                         proto_pools: &proto_pools,
                     };
+                    debug!(
+                        step = step_idx_value,
+                        var = sym(&interner, var),
+                        "executing step"
+                    );
                     let value = execute_step(&step, &ctx, &interner, &deps).await?;
                     RuntimeResult::Ok((var, value))
                 });
@@ -274,7 +319,7 @@ async fn fetch_http(
     let url = as_string(eval_expr(&config.url, vars, interner)?);
     let method_name = config.method.as_deref().unwrap_or("GET").to_uppercase();
     let method = Method::from_bytes(method_name.as_bytes()).map_err(|err| {
-        RuntimeError::Execution(format!(
+        RuntimeError::BadRequest(format!(
             "invalid HTTP method `{method_name}` for fetch: {err}"
         ))
     })?;
@@ -287,6 +332,7 @@ async fn fetch_http(
     let mut last_error = None;
 
     for attempt in 0..attempts {
+        debug!(%method, %url, attempt = attempt + 1, attempts, "sending upstream HTTP request");
         let mut request = client.request(method.clone(), &url);
         if let Some(body) = &request_body {
             request = request.json(body);
@@ -299,9 +345,7 @@ async fn fetch_http(
             Ok(response) => match response.error_for_status() {
                 Ok(response) => {
                     let bytes = response.bytes().await.map_err(|err| {
-                        RuntimeError::Execution(format!(
-                            "failed to read response from {url}: {err}"
-                        ))
+                        RuntimeError::Upstream(format!("failed to read response from {url}: {err}"))
                     })?;
                     return Ok(serde_json::from_slice(&bytes).unwrap_or_else(|_| {
                         Value::String(String::from_utf8_lossy(&bytes).into())
@@ -323,10 +367,15 @@ async fn fetch_http(
         return eval_expr(fallback, vars, interner);
     }
 
-    Err(RuntimeError::Execution(format!(
+    let message = format!(
         "fetch {url} failed: {}",
         last_error.unwrap_or_else(|| "unknown error".to_string())
-    )))
+    );
+    if message.contains("timed out") || message.contains("timeout") {
+        Err(RuntimeError::Timeout(message))
+    } else {
+        Err(RuntimeError::Upstream(message))
+    }
 }
 
 async fn query_db(
@@ -355,7 +404,7 @@ async fn query_db(
         let rows = query
             .fetch_all(&pool)
             .await
-            .map_err(|err| RuntimeError::Execution(format!("database query failed: {err}")))?;
+            .map_err(|err| RuntimeError::Database(format!("database query failed: {err}")))?;
         rows.into_iter()
             .map(row_to_json)
             .collect::<RuntimeResult<Vec<_>>>()
@@ -365,7 +414,7 @@ async fn query_db(
     let result = if let Some(timeout_ms) = config.timeout_ms {
         tokio::time::timeout(Duration::from_millis(timeout_ms), work)
             .await
-            .map_err(|_| RuntimeError::Execution("database query timed out".to_string()))?
+            .map_err(|_| RuntimeError::Timeout("database query timed out".to_string()))?
     } else {
         work.await
     };
@@ -393,7 +442,7 @@ async fn get_db_pool(
         .max_connections(5)
         .connect(url)
         .await
-        .map_err(|err| RuntimeError::Execution(format!("failed to connect to database: {err}")))?;
+        .map_err(|err| RuntimeError::Database(format!("failed to connect to database: {err}")))?;
     db_pools.lock().await.insert(url.to_string(), pool.clone());
     Ok(pool)
 }
@@ -425,7 +474,7 @@ fn row_to_json(row: sqlx::any::AnyRow) -> RuntimeResult<Value> {
 
     for (idx, column) in row.columns().iter().enumerate() {
         let value = decode_column(&row, idx).map_err(|err| {
-            RuntimeError::Execution(format!(
+            RuntimeError::Database(format!(
                 "failed to decode column `{}` ({}) as JSON value: {err}",
                 column.name(),
                 column.type_info().name()
@@ -482,7 +531,7 @@ async fn call_grpc(
     let result = if let Some(timeout_ms) = config.timeout_ms {
         tokio::time::timeout(Duration::from_millis(timeout_ms), work)
             .await
-            .map_err(|_| RuntimeError::Execution("grpc call timed out".to_string()))?
+            .map_err(|_| RuntimeError::Timeout("grpc call timed out".to_string()))?
     } else {
         work.await
     };
@@ -499,10 +548,10 @@ async fn call_grpc(
 async fn grpc_channel(target: &str) -> RuntimeResult<Channel> {
     let endpoint = grpc_endpoint(target)?;
     TonicEndpoint::from_shared(endpoint)
-        .map_err(|err| RuntimeError::Execution(format!("invalid grpc endpoint: {err}")))?
+        .map_err(|err| RuntimeError::BadRequest(format!("invalid grpc endpoint: {err}")))?
         .connect()
         .await
-        .map_err(|err| RuntimeError::Execution(format!("failed to connect grpc: {err}")))
+        .map_err(|err| RuntimeError::Grpc(format!("failed to connect grpc: {err}")))
 }
 
 fn grpc_endpoint(target: &str) -> RuntimeResult<String> {
@@ -755,12 +804,77 @@ fn execute_pipe(
     Ok(current)
 }
 
-fn eval_response(endpoint: &Endpoint, vars: &Vars, interner: &Rodeo) -> RuntimeResult<Value> {
-    let mut object = Map::new();
-    for (key, expr) in &endpoint.response_body {
-        object.insert(key.clone(), eval_expr(expr, vars, interner)?);
+fn eval_response(
+    endpoint: &Endpoint,
+    vars: &Vars,
+    interner: &Rodeo,
+) -> RuntimeResult<EvaluatedResponse> {
+    let body = endpoint
+        .response
+        .body
+        .as_ref()
+        .map(|fields| {
+            let mut body = Map::new();
+            for (key, expr) in fields {
+                body.insert(key.clone(), eval_expr(expr, vars, interner)?);
+            }
+            RuntimeResult::Ok(Value::Object(body))
+        })
+        .transpose()?;
+    let mut headers = HeaderMap::new();
+    for (name, expr) in &endpoint.response.headers {
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|err| {
+            RuntimeError::BadRequest(format!("invalid response header `{name}`: {err}"))
+        })?;
+        let value = as_string(eval_expr(expr, vars, interner)?);
+        let value = HeaderValue::from_str(&value).map_err(|err| {
+            RuntimeError::BadRequest(format!("invalid value for response header `{name}`: {err}"))
+        })?;
+        headers.insert(name, value);
     }
-    Ok(Value::Object(object))
+
+    let mut cookies = Vec::with_capacity(endpoint.response.cookies.len());
+    for (name, expr) in &endpoint.response.cookies {
+        let value = as_string(eval_expr(expr, vars, interner)?);
+        cookies.push(format!("{name}={value}; Path=/"));
+    }
+
+    Ok(EvaluatedResponse {
+        body,
+        headers,
+        cookies,
+    })
+}
+
+fn error_status(error: &RuntimeError) -> StatusCode {
+    match error {
+        RuntimeError::BadRequest(_) => StatusCode::BAD_REQUEST,
+        RuntimeError::Upstream(_) | RuntimeError::Grpc(_) => StatusCode::BAD_GATEWAY,
+        RuntimeError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
+        RuntimeError::InvalidMethod { .. }
+        | RuntimeError::InvalidBindAddress(_)
+        | RuntimeError::Bind(_)
+        | RuntimeError::Serve(_)
+        | RuntimeError::Config(_)
+        | RuntimeError::Database(_)
+        | RuntimeError::Execution(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn error_code(error: &RuntimeError) -> &'static str {
+    match error {
+        RuntimeError::BadRequest(_) => "bad_request",
+        RuntimeError::Upstream(_) => "upstream_error",
+        RuntimeError::Timeout(_) => "timeout",
+        RuntimeError::Database(_) => "database_error",
+        RuntimeError::Grpc(_) => "grpc_error",
+        RuntimeError::Config(_) => "config_error",
+        RuntimeError::InvalidMethod { .. }
+        | RuntimeError::InvalidBindAddress(_)
+        | RuntimeError::Bind(_)
+        | RuntimeError::Serve(_)
+        | RuntimeError::Execution(_) => "runtime_error",
+    }
 }
 
 fn eval_expr(expr: &Expression, vars: &Vars, interner: &Rodeo) -> RuntimeResult<Value> {

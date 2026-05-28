@@ -9,6 +9,7 @@ use velogate::export::export_file;
 use velogate::parser::{ParseDiagnostic, Parser};
 use velogate::planner::{ExecutionPlan, PlanError, build_plan, export_plan_dot};
 use velogate::runtime::Runtime;
+use velogate::validator::{ValidationError, validate_file};
 
 #[derive(ClapParser, Debug)]
 #[command(name = "velogate")]
@@ -74,6 +75,7 @@ struct DumpArgs {
 }
 
 fn main() -> ExitCode {
+    tracing_subscriber::fmt::init();
     let cli = Cli::parse();
 
     match run(cli) {
@@ -145,13 +147,13 @@ fn start(args: StartArgs) -> Result<(), ()> {
 
     rt.block_on(async {
         let actual_workers = tokio::runtime::Handle::current().metrics().num_workers();
-        println!("velogate runtime started with {actual_workers} worker threads");
+        tracing::info!(workers = actual_workers, "velogate runtime started");
 
         let runtime = Runtime::new(ast, parser.interner, plan);
         if let Err(err) = runtime.serve().await {
-            eprintln!("{err}");
+            tracing::error!(error = %err, "velogate runtime failed");
         }
-        println!("velogate runtime stopped");
+        tracing::info!("velogate runtime stopped");
     });
 
     Ok(())
@@ -172,6 +174,11 @@ fn parse_config(path: &Path) -> Result<ParsedConfig, ()> {
     match parser.parse(&source) {
         Ok(mut ast) => {
             resolve_gateway_paths(path, &mut ast);
+            let validation_errors = validate_file(&ast, &parser.interner, path);
+            if !validation_errors.is_empty() {
+                emit_validation_errors(&validation_errors);
+                return Err(());
+            }
             let plan = build_plan(&ast, &parser.interner).map_err(|err| {
                 emit_plan_error(&err);
             })?;
@@ -185,16 +192,24 @@ fn parse_config(path: &Path) -> Result<ParsedConfig, ()> {
 }
 
 fn resolve_gateway_paths(config_path: &Path, ast: &mut FileAST) {
-    let Some(env_file) = ast.gateway.env_file.as_deref() else {
-        return;
-    };
-    let path = PathBuf::from(env_file);
-    if path.is_relative() {
-        ast.gateway.env_file = Some(
-            resolve_config_path(config_path, &path)
+    if let Some(env_file) = ast.gateway.env_file.as_deref() {
+        let path = PathBuf::from(env_file);
+        if path.is_relative() {
+            ast.gateway.env_file = Some(
+                resolve_config_path(config_path, &path)
+                    .display()
+                    .to_string(),
+            );
+        }
+    }
+
+    for proto in &mut ast.gateway.static_protos {
+        let path = PathBuf::from(&proto.path);
+        if path.is_relative() {
+            proto.path = resolve_config_path(config_path, &path)
                 .display()
-                .to_string(),
-        );
+                .to_string();
+        }
     }
 }
 
@@ -202,10 +217,17 @@ fn resolve_config_path(config_path: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
-        config_path
+        let resolved = config_path
             .parent()
             .map(|parent| parent.join(path))
-            .unwrap_or_else(|| path.to_path_buf())
+            .unwrap_or_else(|| path.to_path_buf());
+        if resolved.is_absolute() {
+            resolved
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&resolved))
+                .unwrap_or(resolved)
+        }
     }
 }
 
@@ -233,6 +255,12 @@ fn emit_plan_error(error: &PlanError) {
         PlanError::Cycle { endpoint } => {
             eprintln!("plan error: endpoint `{endpoint}` has a cyclic dependency graph");
         }
+    }
+}
+
+fn emit_validation_errors(errors: &[ValidationError]) {
+    for error in errors {
+        eprintln!("validation error: {}", error.message);
     }
 }
 

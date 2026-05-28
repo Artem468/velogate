@@ -39,7 +39,9 @@ pub struct EndpointExport {
     pub options: Vec<EndpointOptionExport>,
     pub steps: Vec<StepExport>,
     pub response_status: u16,
-    pub response_body: BTreeMap<String, ExprExport>,
+    pub response_body: Option<BTreeMap<String, ExprExport>>,
+    pub response_headers: BTreeMap<String, ExprExport>,
+    pub response_cookies: BTreeMap<String, ExprExport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -265,9 +267,21 @@ fn export_endpoint(endpoint: &Endpoint, interner: &Rodeo) -> EndpointExport {
             .iter()
             .map(|step| export_step(step, interner))
             .collect(),
-        response_status: endpoint.response_status,
-        response_body: endpoint
-            .response_body
+        response_status: endpoint.response.status,
+        response_body: endpoint.response.body.as_ref().map(|body| {
+            body.iter()
+                .map(|(key, value)| (key.clone(), export_expr(value, interner)))
+                .collect()
+        }),
+        response_headers: endpoint
+            .response
+            .headers
+            .iter()
+            .map(|(key, value)| (key.clone(), export_expr(value, interner)))
+            .collect(),
+        response_cookies: endpoint
+            .response
+            .cookies
             .iter()
             .map(|(key, value)| (key.clone(), export_expr(value, interner)))
             .collect(),

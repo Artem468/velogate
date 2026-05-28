@@ -11,7 +11,7 @@ pub Manifest: FileAST = {
 
 GatewayConfig: GatewayConfig = {
     "gateway" <name:String> "{" <items:GatewayItem*> "}" => {
-        let mut port = 0;
+        let mut port_raw = None;
         let mut host = None;
         let mut env_file = None;
         let mut constants = Vec::new();
@@ -19,7 +19,7 @@ GatewayConfig: GatewayConfig = {
         let mut static_protos = Vec::new();
         for item in items {
             match item {
-                GatewayItem::Port(value) => port = value,
+                GatewayItem::Port(value) => port_raw = Some(value),
                 GatewayItem::Host(value) => host = Some(value),
                 GatewayItem::EnvFile(value) => env_file = Some(value),
                 GatewayItem::Constants(value) => constants = value,
@@ -27,12 +27,15 @@ GatewayConfig: GatewayConfig = {
                 GatewayItem::Protos(value) => static_protos = value,
             }
         }
-        GatewayConfig { name, port, host, env_file, constants, static_dbs, static_protos }
+        let port = port_raw
+            .and_then(|value| u16::try_from(value).ok())
+            .unwrap_or_default();
+        GatewayConfig { name, port, port_raw, host, env_file, constants, static_dbs, static_protos }
     }
 };
 
 GatewayItem: GatewayItem = {
-    "port" ":" <port:Int> ","? => GatewayItem::Port(port as u16),
+    "port" ":" <port:Int> ","? => GatewayItem::Port(port),
     "host" ":" <host:String> ","? => GatewayItem::Host(host),
     <key:Ident> ":" <path:String> ","? => {
         match key.as_str() {
@@ -97,21 +100,55 @@ Endpoint: Endpoint = {
         let mut parts = path_method.split_whitespace();
         let method = parts.next().unwrap_or("GET").to_string();
         let path = parts.next().unwrap_or("/").to_string();
-        let (response_status, response_body) = response;
         Endpoint {
             method,
             path,
             options,
             steps,
-            response_status,
-            response_body,
+            response,
         }
     }
 };
 
-EndpointResponse: (u16, HashMap<String, Expression>) = {
-    "respond" <status:Int> "{" <body:ResponseObject> "}" => (status as u16, body),
-    => (200, HashMap::new()),
+EndpointResponse: EndpointResponse = {
+    "respond" <status:Int> "{" <body:ResponseObject> "}" => EndpointResponse {
+        status: u16::try_from(status).unwrap_or_default(),
+        status_raw: status,
+        body: Some(body),
+        headers: HashMap::new(),
+        cookies: HashMap::new(),
+    },
+    "respond" <status:Int> <parts:EndpointResponsePart+> => {
+        let mut response_parts = EndpointResponseParts::default();
+        for part in parts {
+            match part {
+                EndpointResponsePart::Body(value) => response_parts.body = Some(value),
+                EndpointResponsePart::Headers(value) => response_parts.headers = value,
+                EndpointResponsePart::Cookies(value) => response_parts.cookies = value,
+            }
+        }
+        EndpointResponse {
+            status: u16::try_from(status).unwrap_or_default(),
+            status_raw: status,
+            body: response_parts.body,
+            headers: response_parts.headers,
+            cookies: response_parts.cookies,
+        }
+    },
+    "respond" <status:Int> => EndpointResponse {
+        status: u16::try_from(status).unwrap_or_default(),
+        status_raw: status,
+        body: None,
+        headers: HashMap::new(),
+        cookies: HashMap::new(),
+    },
+    => EndpointResponse::default(),
+};
+
+EndpointResponsePart: EndpointResponsePart = {
+    "body" "{" <body:ResponseObject> "}" => EndpointResponsePart::Body(body),
+    "headers" "{" <headers:ResponseObject> "}" => EndpointResponsePart::Headers(headers),
+    "cookies" "{" <cookies:ResponseObject> "}" => EndpointResponsePart::Cookies(cookies),
 };
 
 EndpointOption: EndpointOption = {
@@ -412,6 +449,8 @@ Primary: Expression = {
     <path:PathExpr> => path,
     "query" => Expression::Variable(interner.get_or_intern("query")),
     "env" => Expression::Variable(interner.get_or_intern("env")),
+    "headers" => Expression::Variable(interner.get_or_intern("headers")),
+    "cookies" => Expression::Variable(interner.get_or_intern("cookies")),
     <n:Int> => Expression::Number(n as f64),
     <f:Float> => Expression::Number(f),
     <s:String> => Expression::String(s),
@@ -471,6 +510,8 @@ extern {
         "fallback" => Token::Fallback,
         "method" => Token::Method,
         "body" => Token::Body,
+        "headers" => Token::Headers,
+        "cookies" => Token::Cookies,
         "filter" => Token::Filter,
         "map" => Token::Map,
         "take" => Token::Take,

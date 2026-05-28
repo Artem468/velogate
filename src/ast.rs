@@ -8,6 +8,7 @@ pub type Sym = Spur;
 pub struct GatewayConfig {
     pub name: String,
     pub port: u16,
+    pub port_raw: Option<i64>,
     pub host: Option<String>,
     pub env_file: Option<String>,
     pub constants: Vec<GatewayConstant>,
@@ -99,7 +100,7 @@ pub(crate) enum TailConfigEntry {
 
 #[derive(Debug, Clone)]
 pub(crate) enum GatewayItem {
-    Port(u16),
+    Port(i64),
     Host(String),
     EnvFile(String),
     Constants(Vec<GatewayConstant>),
@@ -213,13 +214,47 @@ pub(crate) enum SecureRuleConfigEntry {
 }
 
 #[derive(Debug, Clone)]
+pub struct EndpointResponse {
+    pub status: u16,
+    pub status_raw: i64,
+    pub body: Option<HashMap<String, Expression>>,
+    pub headers: HashMap<String, Expression>,
+    pub cookies: HashMap<String, Expression>,
+}
+
+impl Default for EndpointResponse {
+    fn default() -> Self {
+        Self {
+            status: 200,
+            status_raw: 200,
+            body: None,
+            headers: HashMap::new(),
+            cookies: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct EndpointResponseParts {
+    pub body: Option<HashMap<String, Expression>>,
+    pub headers: HashMap<String, Expression>,
+    pub cookies: HashMap<String, Expression>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum EndpointResponsePart {
+    Body(HashMap<String, Expression>),
+    Headers(HashMap<String, Expression>),
+    Cookies(HashMap<String, Expression>),
+}
+
+#[derive(Debug, Clone)]
 pub struct Endpoint {
     pub method: String,
     pub path: String,
     pub options: Vec<EndpointOption>,
     pub steps: Vec<Step>,
-    pub response_status: u16,
-    pub response_body: HashMap<String, Expression>,
+    pub response: EndpointResponse,
 }
 
 #[derive(Debug, Clone)]

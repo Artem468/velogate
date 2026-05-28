@@ -123,14 +123,16 @@ mod tests {
         let endpoint = &ast.endpoints[0];
         assert_eq!(endpoint.method, "GET");
         assert_eq!(endpoint.path, "/v1/users");
-        assert_eq!(endpoint.response_status, 200);
+        assert_eq!(endpoint.response.status, 200);
         assert_eq!(endpoint.steps.len(), 2);
         assert!(matches!(endpoint.steps[0], Step::Let { .. }));
         assert!(matches!(endpoint.steps[1], Step::FetchHttp { .. }));
-        assert!(matches!(
-            endpoint.response_body.get("ok"),
-            Some(Expression::Boolean(true))
-        ));
+        let body = endpoint
+            .response
+            .body
+            .as_ref()
+            .expect("response body should be present");
+        assert!(matches!(body.get("ok"), Some(Expression::Boolean(true))));
     }
 
     #[test]
@@ -319,7 +321,58 @@ mod tests {
 
         assert_eq!(ast.endpoints[0].method, "GET");
         assert_eq!(ast.endpoints[0].path, "/api/v1/todos/:id");
-        assert_eq!(ast.endpoints[0].response_status, 200);
-        assert!(ast.endpoints[0].response_body.is_empty());
+        assert_eq!(ast.endpoints[0].response.status, 200);
+        assert!(ast.endpoints[0].response.body.is_none());
+    }
+
+    #[test]
+    fn parses_response_body_headers_and_cookies() {
+        let source = r#"
+            gateway "api" { port: 8080 }
+
+            endpoint "GET /x" {
+                let token = "abc";
+                respond 202
+                    headers { "x-trace": token }
+                    cookies { "session": token }
+                    body { "ok": true }
+            }
+        "#;
+
+        let mut parser = Parser::new(Rodeo::new());
+        let ast = parser.parse(source).expect("response parts should parse");
+        let response = &ast.endpoints[0].response;
+
+        assert_eq!(response.status, 202);
+        assert!(response.headers.contains_key("x-trace"));
+        assert!(response.cookies.contains_key("session"));
+        assert!(
+            response
+                .body
+                .as_ref()
+                .is_some_and(|body| body.contains_key("ok"))
+        );
+    }
+
+    #[test]
+    fn parses_status_only_response() {
+        let source = r#"
+            gateway "api" { port: 8080 }
+
+            endpoint "DELETE /x" {
+                respond 204
+            }
+        "#;
+
+        let mut parser = Parser::new(Rodeo::new());
+        let ast = parser
+            .parse(source)
+            .expect("status-only response should parse");
+        let response = &ast.endpoints[0].response;
+
+        assert_eq!(response.status, 204);
+        assert!(response.body.is_none());
+        assert!(response.headers.is_empty());
+        assert!(response.cookies.is_empty());
     }
 }

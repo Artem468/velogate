@@ -24,7 +24,7 @@ pub(super) fn gateway_vars(ast: &FileAST, interner: &Rodeo) -> RuntimeResult<Var
 
     for constant in &ast.gateway.constants {
         let value = eval_expr(&constant.value, &vars, interner).map_err(|err| {
-            RuntimeError::Execution(format!(
+            RuntimeError::Config(format!(
                 "failed to evaluate gateway constant `{}`: {err}",
                 sym(interner, constant.name)
             ))
@@ -39,9 +39,8 @@ fn load_env_file(path: Option<&str>) -> RuntimeResult<Map<String, Value>> {
     let Some(path) = path else {
         return Ok(Map::new());
     };
-    let contents = std::fs::read_to_string(path).map_err(|err| {
-        RuntimeError::Execution(format!("failed to read env_file `{path}`: {err}"))
-    })?;
+    let contents = std::fs::read_to_string(path)
+        .map_err(|err| RuntimeError::Config(format!("failed to read env_file `{path}`: {err}")))?;
     Ok(parse_env_file(&contents))
 }
 
