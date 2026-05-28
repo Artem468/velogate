@@ -37,18 +37,8 @@ GatewayConfig: GatewayConfig = {
 GatewayItem: GatewayItem = {
     "port" ":" <port:Int> ","? => GatewayItem::Port(port),
     "host" ":" <host:String> ","? => GatewayItem::Host(host),
-    <key:Ident> ":" <path:String> ","? => {
-        match key.as_str() {
-            "env_file" => GatewayItem::EnvFile(path),
-            _ => GatewayItem::EnvFile(path),
-        }
-    },
-    <key:Ident> ":" "{" <constants:GatewayConstantList> "}" ","? => {
-        match key.as_str() {
-            "constants" => GatewayItem::Constants(constants),
-            _ => GatewayItem::Constants(constants),
-        }
-    },
+    "env_file" ":" <path:String> ","? => GatewayItem::EnvFile(path),
+    "constants" ":" "{" <constants:GatewayConstantList> "}" ","? => GatewayItem::Constants(constants),
     "databases" ":" "[" <dbs:StaticDbList> "]" ","? => GatewayItem::Databases(dbs),
     "protos" ":" "[" <protos:StaticProtoList> "]" ","? => GatewayItem::Protos(protos),
 };
@@ -211,16 +201,15 @@ SecureRuleConfigEntryList: Vec<SecureRuleConfigEntry> = {
 };
 
 SecureRuleConfigEntry: SecureRuleConfigEntry = {
-    <key:Ident> ":" <value:Expression> => {
-        match (key.as_str(), value) {
-            ("checks", Expression::Array(items)) => SecureRuleConfigEntry::Checks(items),
-            ("checks", value) => SecureRuleConfigEntry::Checks(vec![value]),
-            ("secret", value) => SecureRuleConfigEntry::Secret(value),
-            ("username", value) => SecureRuleConfigEntry::Username(value),
-            ("password", value) => SecureRuleConfigEntry::Password(value),
-            (_, value) => SecureRuleConfigEntry::Secret(value),
+    "checks" ":" <value:Expression> => {
+        match value {
+            Expression::Array(items) => SecureRuleConfigEntry::Checks(items),
+            value => SecureRuleConfigEntry::Checks(vec![value]),
         }
     },
+    "secret" ":" <value:Expression> => SecureRuleConfigEntry::Secret(value),
+    "username" ":" <value:Expression> => SecureRuleConfigEntry::Username(value),
+    "password" ":" <value:Expression> => SecureRuleConfigEntry::Password(value),
 };
 
 IdentList: Vec<String> = {
@@ -228,6 +217,16 @@ IdentList: Vec<String> = {
         if let Some(last) = e { v.push(last); }
         v
     }
+};
+
+IdentLike: String = {
+    <value:Ident> => value,
+    "secret" => "secret".to_string(),
+    "username" => "username".to_string(),
+    "password" => "password".to_string(),
+    "checks" => "checks".to_string(),
+    "env_file" => "env_file".to_string(),
+    "constants" => "constants".to_string(),
 };
 
 Step: Step = {
@@ -440,7 +439,7 @@ Factor: Expression = {
 };
 
 Postfix: Expression = {
-    <e:Postfix> "." <field:Ident> => Expression::PropertyAccess(Box::new(e), interner.get_or_intern(&field)),
+    <e:Postfix> "." <field:IdentLike> => Expression::PropertyAccess(Box::new(e), interner.get_or_intern(&field)),
     <e:Postfix> "(" <args:CallArgs> ")" => Expression::Call { callee: Box::new(e), args },
     Primary
 };
@@ -463,7 +462,7 @@ Primary: Expression = {
 };
 
 PathExpr: Expression = {
-    <head:Ident> <tail:("::" <Ident>)*> => {
+    <head:IdentLike> <tail:("::" <IdentLike>)*> => {
         let mut expr = Expression::Variable(interner.get_or_intern(&head));
         for item in tail {
             expr = Expression::PropertyAccess(Box::new(expr), interner.get_or_intern(&item));
@@ -490,9 +489,15 @@ extern {
         "protos" => Token::Protos,
         "port" => Token::Port,
         "host" => Token::Host,
+        "env_file" => Token::EnvFile,
+        "constants" => Token::Constants,
         "url" => Token::Url,
         "path" => Token::Path,
         "secure" => Token::Secure,
+        "secret" => Token::Secret,
+        "username" => Token::Username,
+        "password" => Token::Password,
+        "checks" => Token::Checks,
         "rate_limit" => Token::RateLimit,
         "let" => Token::Let,
         "fetch" => Token::Fetch,

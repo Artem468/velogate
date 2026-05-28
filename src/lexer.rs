@@ -23,6 +23,10 @@ pub(crate) enum Token {
     Port,
     #[token("host")]
     Host,
+    #[token("env_file")]
+    EnvFile,
+    #[token("constants")]
+    Constants,
     #[token("url")]
     Url,
     #[token("path")]
@@ -32,6 +36,14 @@ pub(crate) enum Token {
 
     #[token("secure")]
     Secure,
+    #[token("secret")]
+    Secret,
+    #[token("username")]
+    Username,
+    #[token("password")]
+    Password,
+    #[token("checks")]
+    Checks,
     #[token("rate_limit")]
     RateLimit,
     #[token("let")]

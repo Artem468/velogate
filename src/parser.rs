@@ -258,6 +258,73 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unknown_gateway_string_key() {
+        let source = r#"
+            gateway "api" {
+                port: 8080,
+                envfile: ".env"
+            }
+        "#;
+
+        let mut parser = Parser::new(Rodeo::new());
+        assert!(parser.parse(source).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_gateway_object_key() {
+        let source = r#"
+            gateway "api" {
+                port: 8080,
+                constantz: {
+                    "api_base": "https://example.test"
+                }
+            }
+        "#;
+
+        let mut parser = Parser::new(Rodeo::new());
+        assert!(parser.parse(source).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_secure_rule_key() {
+        let source = r#"
+            gateway "api" { port: 8080 }
+
+            endpoint "GET /x" {
+                secure: [
+                    JWT {
+                        secrit: "dev-secret"
+                    }
+                ],
+                respond 200 { "ok": true }
+            }
+        "#;
+
+        let mut parser = Parser::new(Rodeo::new());
+        assert!(parser.parse(source).is_err());
+    }
+
+    #[test]
+    fn config_keywords_can_still_be_property_names() {
+        let source = r#"
+            gateway "api" { port: 8080 }
+
+            endpoint "GET /x" {
+                respond 200 {
+                    "user": basic.username,
+                    "env": body.env_file,
+                    "checks": jwt.checks
+                }
+            }
+        "#;
+
+        let mut parser = Parser::new(Rodeo::new());
+        parser
+            .parse(source)
+            .expect("config keywords should work as property names");
+    }
+
+    #[test]
     fn parses_grpc_call_step() {
         let source = r#"
             gateway "api" { port: 8080 }
