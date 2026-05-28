@@ -4,8 +4,9 @@ use lasso::Rodeo;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use velogate::ast::FileAST;
+use velogate::ast::{EndpointOption, FileAST};
 use velogate::export::export_file;
+use velogate::linter::{LintWarning, lint_file};
 use velogate::parser::{ParseDiagnostic, Parser};
 use velogate::planner::{ExecutionPlan, PlanError, build_plan, export_plan_dot};
 use velogate::runtime::Runtime;
@@ -26,6 +27,18 @@ enum Commands {
     /// Validate a .gate file without starting the server.
     Check(CheckArgs),
 
+    /// Format a .gate file in place or check formatting.
+    Fmt(FmtArgs),
+
+    /// Run static lint warnings after syntax, semantic and planning checks.
+    Lint(CheckArgs),
+
+    /// Print endpoint routes, auth, rate limits and step dependencies.
+    Routes(CheckArgs),
+
+    /// Inspect config health and resolved inputs.
+    Doctor(CheckArgs),
+
     /// Start the API gateway runtime.
     Start(StartArgs),
 
@@ -38,6 +51,17 @@ struct CheckArgs {
     /// Path to a .gate config file.
     #[arg(short, long, value_name = "FILE")]
     config: PathBuf,
+}
+
+#[derive(Args, Debug)]
+struct FmtArgs {
+    /// Path to a .gate config file.
+    #[arg(short, long, value_name = "FILE")]
+    config: PathBuf,
+
+    /// Check formatting without writing changes.
+    #[arg(long)]
+    check: bool,
 }
 
 #[derive(Args, Debug)]
@@ -91,9 +115,136 @@ fn run(cli: Cli) -> Result<(), ()> {
             println!("syntax and plan ok: {}", args.config.display());
             Ok(())
         }
+        Commands::Fmt(args) => fmt_config(args),
+        Commands::Lint(args) => lint(args),
+        Commands::Routes(args) => routes(args),
+        Commands::Doctor(args) => doctor(args),
         Commands::Start(args) => start(args),
         Commands::Dump(args) => dump(args),
     }
+}
+
+fn fmt_config(args: FmtArgs) -> Result<(), ()> {
+    let source = fs::read_to_string(&args.config).map_err(|err| {
+        eprintln!("failed to read {}: {err}", args.config.display());
+    })?;
+    let formatted = format_gate_source(&source);
+
+    if args.check {
+        if source == formatted {
+            println!("format ok: {}", args.config.display());
+            return Ok(());
+        }
+        eprintln!("format check failed: {}", args.config.display());
+        return Err(());
+    }
+
+    if source != formatted {
+        fs::write(&args.config, formatted).map_err(|err| {
+            eprintln!("failed to write {}: {err}", args.config.display());
+        })?;
+        println!("formatted: {}", args.config.display());
+    } else {
+        println!("format ok: {}", args.config.display());
+    }
+
+    Ok(())
+}
+
+fn lint(args: CheckArgs) -> Result<(), ()> {
+    let parsed = parse_config(&args.config)?;
+    let warnings = lint_file(&parsed.ast, &parsed.parser.interner);
+    emit_lint_warnings(&warnings);
+    println!(
+        "lint ok: {} ({} endpoint(s), {} planned step(s), {} warning(s))",
+        args.config.display(),
+        parsed.ast.endpoints.len(),
+        parsed
+            .plan
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.steps.len())
+            .sum::<usize>(),
+        warnings.len()
+    );
+    Ok(())
+}
+
+fn routes(args: CheckArgs) -> Result<(), ()> {
+    let ParsedConfig { ast, parser, plan } = parse_config(&args.config)?;
+
+    for (idx, endpoint) in ast.endpoints.iter().enumerate() {
+        println!("{} {}", endpoint.method, endpoint.path);
+        println!("  response: {}", endpoint.response.status);
+        println!("  auth: {}", route_auth(endpoint, &parser.interner));
+        println!(
+            "  rate_limit: {}",
+            route_rate_limit(endpoint, &parser.interner)
+        );
+
+        if let Some(endpoint_plan) = plan.endpoints.get(idx) {
+            println!("  steps:");
+            if endpoint_plan.steps.is_empty() {
+                println!("    - none");
+            }
+            for step in &endpoint_plan.steps {
+                let deps = if step.dependencies.is_empty() {
+                    "none".to_string()
+                } else {
+                    step.dependencies
+                        .iter()
+                        .map(|dep| endpoint_plan.steps[*dep].produces.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                println!(
+                    "    - #{} {} {:?} deps: {}",
+                    step.index, step.produces, step.kind, deps
+                );
+            }
+
+            println!("  layers:");
+            if endpoint_plan.layers.is_empty() {
+                println!("    - none");
+            }
+            for (layer_idx, layer) in endpoint_plan.layers.iter().enumerate() {
+                let names = layer
+                    .iter()
+                    .map(|step_idx| endpoint_plan.steps[*step_idx].produces.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("    - layer {layer_idx}: {names}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn doctor(args: CheckArgs) -> Result<(), ()> {
+    let ParsedConfig { ast, plan, .. } = parse_config(&args.config)?;
+    let host = ast.gateway.host.as_deref().unwrap_or("127.0.0.1");
+
+    println!("doctor ok: {}", args.config.display());
+    println!("gateway: {}", ast.gateway.name);
+    println!("bind: {host}:{}", ast.gateway.port);
+    println!(
+        "env_file: {}",
+        ast.gateway.env_file.as_deref().unwrap_or("none")
+    );
+    println!("constants: {}", ast.gateway.constants.len());
+    println!("databases: {}", ast.gateway.static_dbs.len());
+    println!("protos: {}", ast.gateway.static_protos.len());
+    println!("endpoints: {}", ast.endpoints.len());
+    println!(
+        "planned_steps: {}",
+        plan.endpoints
+            .iter()
+            .map(|endpoint| endpoint.steps.len())
+            .sum::<usize>()
+    );
+
+    Ok(())
 }
 
 fn dump(args: DumpArgs) -> Result<(), ()> {
@@ -157,6 +308,70 @@ fn start(args: StartArgs) -> Result<(), ()> {
     });
 
     Ok(())
+}
+
+fn format_gate_source(source: &str) -> String {
+    let normalized = source.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = String::new();
+    let mut blank_count = 0usize;
+
+    for line in normalized.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            blank_count += 1;
+            if blank_count <= 1 && !out.is_empty() {
+                out.push('\n');
+            }
+            continue;
+        }
+
+        blank_count = 0;
+        out.push_str(trimmed);
+        out.push('\n');
+    }
+
+    out
+}
+
+fn route_auth(endpoint: &velogate::ast::Endpoint, interner: &Rodeo) -> String {
+    let schemes = endpoint
+        .options
+        .iter()
+        .filter_map(|option| match option {
+            EndpointOption::Secure(rules) => Some(
+                rules
+                    .iter()
+                    .map(|rule| interner.resolve(&rule.scheme))
+                    .collect::<Vec<_>>(),
+            ),
+            EndpointOption::RateLimit { .. } => None,
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+
+    if schemes.is_empty() {
+        "none".to_string()
+    } else {
+        schemes.join(", ")
+    }
+}
+
+fn route_rate_limit(endpoint: &velogate::ast::Endpoint, interner: &Rodeo) -> String {
+    endpoint
+        .options
+        .iter()
+        .find_map(|option| match option {
+            EndpointOption::RateLimit {
+                limit,
+                unit,
+                window_ms,
+            } => Some(format!(
+                "{limit}/{} window {window_ms}ms by ip",
+                interner.resolve(unit)
+            )),
+            EndpointOption::Secure(_) => None,
+        })
+        .unwrap_or_else(|| "none".to_string())
 }
 
 struct ParsedConfig {
@@ -261,6 +476,12 @@ fn emit_plan_error(error: &PlanError) {
 fn emit_validation_errors(errors: &[ValidationError]) {
     for error in errors {
         eprintln!("validation error: {}", error.message);
+    }
+}
+
+fn emit_lint_warnings(warnings: &[LintWarning]) {
+    for warning in warnings {
+        eprintln!("lint warning [{}]: {}", warning.rule, warning.message);
     }
 }
 

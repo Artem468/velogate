@@ -17,8 +17,11 @@ VeloGate - декларативный API gateway/BFF runtime. Он читает
 - Built-in функции и методы для строк, массивов, проверок и форматирования.
 - SQL запросы через `db::query`.
 - gRPC unary calls, включая protobuf reflection через `.proto`.
+- Semantic validator до построения плана: обязательный порт, диапазоны статусов, HTTP methods, rate-limit units, дубликаты routes/constants/db/proto и существование env/proto файлов.
 - Planner проверяет неизвестные переменные, дубликаты и зависимости до старта runtime.
 - Dump/export AST, plan и graph.
+- CLI-команды `fmt`, `lint`, `routes`, `doctor`.
+- Structured logs через `tracing`.
 
 ## Быстрый пример
 
@@ -232,7 +235,50 @@ endpoint "GET /api/v1/todos" {
 }
 ```
 
+Rate limit считается по IP клиента. Runtime использует первый доступный источник:
+
+- `x-forwarded-for`;
+- `x-real-ip`;
+- socket address из Axum `ConnectInfo`;
+- `unknown`, если IP определить нельзя.
+
 Если лимит превышен, runtime возвращает `429`.
+
+## Respond
+
+Короткая форма возвращает JSON-объект:
+
+```rust
+respond 200 {
+    "ok": true,
+    "data": users
+}
+```
+
+Расширенная форма позволяет вернуть тело, headers и cookies в любой нужной комбинации:
+
+```rust
+respond 200
+    headers {
+        "x-trace-id": headers.x_trace_id,
+        "cache-control": "no-store"
+    }
+    cookies {
+        "session": token
+    }
+    body {
+        "ok": true,
+        "data": users
+    }
+```
+
+`body` всегда является словарем. Можно вернуть только статус без тела:
+
+```rust
+respond 204
+```
+
+Можно вернуть только тело и headers, только тело и cookies, только cookies/headers, или все вместе.
 
 ## Pipe: filter, map, take
 
@@ -410,12 +456,115 @@ Planner также отклоняет:
 - неизвестные переменные;
 - циклические зависимости.
 
+## Validation
+
+После парсинга и до planner-а VeloGate запускает semantic validator. Он отклоняет:
+
+- отсутствующий `gateway.port`;
+- `gateway.port` вне диапазона `1..65535`;
+- response status вне диапазона `100..599`;
+- неподдерживаемые HTTP methods;
+- неизвестные `rate_limit` units;
+- дубликаты endpoint routes;
+- дубликаты gateway constants, databases и protos;
+- отсутствующие `gateway.env_file` и `.proto` файлы.
+
+`check`, `lint`, `start`, `dump`, `routes` и `doctor` проходят через этот слой.
+
+`check` отвечает на вопрос "можно ли загрузить и запланировать конфиг". `lint` сначала выполняет тот же строгий pipeline, а затем добавляет предупреждения по качеству конфигурации.
+
+## Observability
+
+Runtime использует `tracing`. Сейчас логируются:
+
+- старт runtime и количество worker threads;
+- bind address;
+- начало обработки request-а на endpoint-е;
+- отказ security rule;
+- выполнение step-а;
+- попытки исходящего HTTP request-а, включая method, url и номер retry;
+- runtime errors с endpoint, HTTP status и кодом ошибки.
+
+Уровень логирования можно настраивать через `RUST_LOG`, например:
+
+```powershell
+$env:RUST_LOG="velogate=debug,tower_http=info"
+cargo run -- start --config examples/main.gate
+```
+
 ## CLI
 
-Проверить `.gate` файл:
+Проверить `.gate` файл на синтаксис, semantic validation и execution plan:
 
 ```powershell
 cargo run -- check --config examples/main.gate
+```
+
+Запустить lint. Он не заменяет validator: ошибки по-прежнему останавливают команду, а warnings выводятся отдельно и не делают конфиг невалидным.
+
+```powershell
+cargo run -- lint --config examples/main.gate
+```
+
+Сейчас lint предупреждает о:
+
+- `public_bind` - gateway слушает `0.0.0.0`;
+- `public_endpoint` - endpoint без `secure`;
+- `unused_constant` - gateway constant не используется endpoint-ами;
+- `unused_database` - database объявлена, но не используется;
+- `unused_proto` - proto объявлен, но не используется;
+- `fetch_without_timeout` - исходящий HTTP fetch без timeout;
+- `retry_without_delay` - retry без delay;
+- `fallback_without_retry` - fallback без retry;
+- `db_without_timeout` - DB query без timeout;
+- `grpc_without_timeout` - gRPC call без timeout;
+- `fallback_without_timeout` - fallback на gRPC call без timeout.
+
+Пример:
+
+```text
+lint warning [public_bind]: gateway binds to 0.0.0.0; make sure this is intended
+lint warning [public_endpoint]: endpoint `GET /api/v1/todos` has no security rule
+lint ok: examples/main.gate (6 endpoint(s), 5 planned step(s), 6 warning(s))
+```
+
+Нормализовать `.gate` файл. Сейчас formatter сохраняет комментарии и структуру файла, нормализует переводы строк, хвостовые пробелы, повторные пустые строки и финальный newline:
+
+```powershell
+cargo run -- fmt --config examples/main.gate
+```
+
+Проверить форматирование без записи:
+
+```powershell
+cargo run -- fmt --config examples/main.gate --check
+```
+
+Показать routes, auth, rate limits, step dependencies и execution layers:
+
+```powershell
+cargo run -- routes --config examples/main.gate
+```
+
+Пример вывода:
+
+```text
+GET /api/v1/todos
+  response: 200
+  auth: none
+  rate_limit: 100/rps window 1000ms by ip
+  steps:
+    - #0 raw_todos FetchHttp deps: none
+    - #1 completed_todos Pipe deps: raw_todos
+  layers:
+    - layer 0: raw_todos
+    - layer 1: completed_todos
+```
+
+Проверить общее состояние конфига и резолвинг входных файлов:
+
+```powershell
+cargo run -- doctor --config examples/main.gate
 ```
 
 Запустить gateway:
