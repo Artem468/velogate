@@ -20,13 +20,13 @@ endpoint "GET /api/v1/todos" {
     };
 
     let completed_todos = raw_todos
-        | filter(t => t.id > 10 && t.id < 20)
-        | map(t => {
-            "id": t.id,
-            "user_id": t.userId,
-            "title": t.title
-          })
-        | take(default_take);
+    | filter(t => t.id > 10 && t.id < 20)
+    | map(t => {
+        "id": t.id,
+        "user_id": t.userId,
+        "title": t.title
+    })
+    | take(default_take);
 
     respond 200 {
         "service": service_name,
@@ -133,5 +133,33 @@ endpoint "PATCH /api/v1/todos/:id" {
     respond 200 {
         "updated": updated_todo,
         "request_body": body
+    }
+}
+
+endpoint "GET /api/v1/new" {
+    rate_limit: 100/rps window 1000ms,
+    secure: [JWT],
+
+    fetch todos_api + "/todos/" as result {
+        method: "POST",
+        body: { "data": "someonge" },
+        timeout: 500ms,
+        retry: 5 times,
+        delay: 3000ms,
+        fallback: { "result": "error" }
+    };
+
+    let completed_tod = result
+    | filter(t => t.id > 10 && t.id < 20)
+    | map(t => {
+        "id": t.id,
+        "title": t.title,
+        "user_id": t.userId
+    })
+    | take(default_take);
+
+    respond 200 {
+        "ok": true,
+        "result": completed_tod
     }
 }

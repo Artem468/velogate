@@ -64,6 +64,9 @@ pub struct SecureRuleExport {
     pub has_secret: bool,
     pub has_username: bool,
     pub has_password: bool,
+    pub secret: Option<ExprExport>,
+    pub username: Option<ExprExport>,
+    pub password: Option<ExprExport>,
     pub checks: Vec<ExprExport>,
 }
 
@@ -194,6 +197,7 @@ pub enum PipeOpExport {
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExprExport {
+    Null,
     Variable {
         name: String,
     },
@@ -536,6 +540,7 @@ fn object_schema(
 
 fn expr_schema(expr: &Expression, interner: &Rodeo) -> Value {
     match expr {
+        Expression::Null => json!({ "nullable": true }),
         Expression::String(_) => json!({ "type": "string" }),
         Expression::Number(_) => json!({ "type": "number" }),
         Expression::Boolean(_) => json!({ "type": "boolean" }),
@@ -658,6 +663,15 @@ fn export_endpoint_option(option: &EndpointOption, interner: &Rodeo) -> Endpoint
                     has_secret: rule.secret.is_some(),
                     has_username: rule.username.is_some(),
                     has_password: rule.password.is_some(),
+                    secret: rule.secret.as_ref().map(|expr| export_expr(expr, interner)),
+                    username: rule
+                        .username
+                        .as_ref()
+                        .map(|expr| export_expr(expr, interner)),
+                    password: rule
+                        .password
+                        .as_ref()
+                        .map(|expr| export_expr(expr, interner)),
                     checks: rule
                         .checks
                         .iter()
@@ -748,6 +762,7 @@ fn export_pipe_op(op: &PipeOp, interner: &Rodeo) -> PipeOpExport {
 
 fn export_expr(expr: &Expression, interner: &Rodeo) -> ExprExport {
     match expr {
+        Expression::Null => ExprExport::Null,
         Expression::Variable(name) => ExprExport::Variable {
             name: sym(interner, *name),
         },
@@ -897,7 +912,10 @@ fn collect_expr_deps(expr: &Expression, interner: &Rodeo, deps: &mut Vec<String>
                 collect_expr_deps(expr, interner, deps);
             }
         }
-        Expression::Number(_) | Expression::String(_) | Expression::Boolean(_) => {}
+        Expression::Null
+        | Expression::Number(_)
+        | Expression::String(_)
+        | Expression::Boolean(_) => {}
     }
 }
 

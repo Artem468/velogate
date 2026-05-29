@@ -146,6 +146,8 @@ pub(crate) enum Token {
     True,
     #[token("false")]
     False,
+    #[token("null")]
+    Null,
 
     #[token("{")]
     BraceOpen,

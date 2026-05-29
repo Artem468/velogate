@@ -36,6 +36,7 @@ pub struct StaticProto {
 
 #[derive(Debug, Clone)]
 pub enum Expression {
+    Null,
     Variable(Sym),
     Number(f64),
     String(String),

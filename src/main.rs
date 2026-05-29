@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use velogate::ast::{EndpointOption, FileAST};
+use velogate::dev::{DevConfig, run_dev_server};
 use velogate::export::{export_file, export_openapi};
 use velogate::linter::{LintWarning, lint_file};
 use velogate::parser::{ParseDiagnostic, Parser};
@@ -42,6 +43,9 @@ enum Commands {
     /// Start the API gateway runtime.
     Start(StartArgs),
 
+    /// Start the API gateway runtime and open the embedded visual editor.
+    Dev(DevArgs),
+
     /// Export internal representation.
     Dump(DumpArgs),
 }
@@ -69,6 +73,25 @@ struct StartArgs {
     /// Path to a .gate config file.
     #[arg(short, long, value_name = "FILE")]
     config: PathBuf,
+
+    /// Tokio worker thread count.
+    #[arg(short, long)]
+    workers: Option<usize>,
+
+    /// Path to an environment config file.
+    #[arg(long, value_name = "ENV_FILE")]
+    env_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+struct DevArgs {
+    /// Path to a .gate config file.
+    #[arg(short, long, value_name = "FILE")]
+    config: PathBuf,
+
+    /// UI editor port. If omitted, the OS assigns a free port.
+    #[arg(short, long)]
+    port: Option<u16>,
 
     /// Tokio worker thread count.
     #[arg(short, long)]
@@ -121,6 +144,7 @@ fn run(cli: Cli) -> Result<(), ()> {
         Commands::Routes(args) => routes(args),
         Commands::Doctor(args) => doctor(args),
         Commands::Start(args) => start(args),
+        Commands::Dev(args) => dev(args),
         Commands::Dump(args) => dump(args),
     }
 }
@@ -316,6 +340,31 @@ fn start(args: StartArgs) -> Result<(), ()> {
     });
 
     Ok(())
+}
+
+fn dev(args: DevArgs) -> Result<(), ()> {
+    let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
+    runtime_builder.enable_all();
+
+    if let Some(worker_threads) = args.workers {
+        runtime_builder.worker_threads(worker_threads);
+    }
+
+    let rt = runtime_builder.build().map_err(|err| {
+        eprintln!("failed to initialize Tokio runtime: {err}");
+    })?;
+
+    rt.block_on(async move {
+        run_dev_server(DevConfig {
+            config_path: args.config,
+            env_file: args.env_file,
+            ui_port: args.port,
+        })
+        .await
+        .map_err(|err| {
+            eprintln!("dev server failed: {err}");
+        })
+    })
 }
 
 fn format_gate_source(source: &str) -> String {

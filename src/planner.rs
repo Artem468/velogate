@@ -434,7 +434,10 @@ fn collect_expr_reads(expr: &Expression, reads: &mut BTreeSet<Sym>, bound: &BTre
                 collect_expr_reads(expr, reads, bound);
             }
         }
-        Expression::Number(_) | Expression::String(_) | Expression::Boolean(_) => {}
+        Expression::Null
+        | Expression::Number(_)
+        | Expression::String(_)
+        | Expression::Boolean(_) => {}
     }
 }
 

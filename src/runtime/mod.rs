@@ -83,6 +83,13 @@ impl Runtime {
     }
 
     pub async fn serve(self) -> RuntimeResult<()> {
+        self.serve_with_shutdown(std::future::pending::<()>()).await
+    }
+
+    pub async fn serve_with_shutdown<F>(self, shutdown: F) -> RuntimeResult<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
         let addr = self.bind_addr()?;
         let router = self.router()?;
         let listener = tokio::net::TcpListener::bind(addr)
@@ -94,6 +101,7 @@ impl Runtime {
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .with_graceful_shutdown(shutdown)
         .await
         .map_err(RuntimeError::Serve)
     }
@@ -1051,6 +1059,7 @@ fn error_code(error: &RuntimeError) -> &'static str {
 
 fn eval_expr(expr: &Expression, vars: &Vars, interner: &Rodeo) -> RuntimeResult<Value> {
     match expr {
+        Expression::Null => Ok(Value::Null),
         Expression::Variable(name) => vars.get(name).cloned().ok_or_else(|| {
             RuntimeError::Execution(format!(
                 "undefined runtime variable `{}`",

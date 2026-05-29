@@ -1,2 +1,4 @@
 /target
 .idea/
+editor/node_modules/
+editor/dist/

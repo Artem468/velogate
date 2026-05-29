@@ -642,6 +642,25 @@ cargo run -- doctor --config examples/main.gate
 cargo run -- start --config examples/main.gate --workers 4
 ```
 
+Start gateway with the embedded visual editor. `--port` is the editor UI port; when it is omitted, the OS assigns a free port and the CLI prints the URL.
+
+```powershell
+cargo run -- dev --config examples/main.gate --port 3000
+```
+
+The editor serves the built Svelte bundle from `editor/dist` via `rust_embed`, reads the parsed `.gate` model from the Rust parser, shows endpoint nodes with Svelte Flow + ELK layout, and exposes Start/Stop/Restart controls for the gateway runtime.
+
+Frontend development with Vite HMR runs separately and proxies `/api` to the Rust editor server:
+
+```powershell
+cargo run -- dev --config examples/main.gate --port 3000
+cd editor
+npm install
+npm run dev -- --port 5173
+```
+
+Open `http://127.0.0.1:5173` for websocket hot reload. Set `VELOGATE_EDITOR_API` if the Rust editor API is not on `http://127.0.0.1:3000`.
+
 Переопределить env-файл из CLI:
 
 ```powershell
