@@ -802,158 +802,369 @@ fn execute_pipe(
     let mut current = eval_expr(source, vars, interner)?;
 
     for op in operations {
-        match op {
-            PipeOp::Filter { param, condition } => {
-                let items = take_array(current, "filter")?;
-                let mut filtered = Vec::new();
-                let mut scoped = vars.clone();
-                for item in items {
-                    scoped.insert(*param, item.clone());
-                    if truthy(&eval_expr(condition, &scoped, interner)?) {
-                        filtered.push(item);
-                    }
-                }
-                current = Value::Array(filtered);
+        current = match op {
+            PipeOp::Closure { name, param, value } => {
+                let name = sym(interner, *name);
+                execute_pipe_closure_op(name, current, *param, value, vars, interner)?
             }
-            PipeOp::Map { param, value } => {
-                let items = take_array(current, "map")?;
-                let mut mapped = Vec::with_capacity(items.len());
-                let mut scoped = vars.clone();
-                for item in items {
-                    scoped.insert(*param, item);
-                    mapped.push(eval_expr(value, &scoped, interner)?);
-                }
-                current = Value::Array(mapped);
-            }
-            PipeOp::Sort { param, key } => {
-                let items = take_array(current, "sort")?;
-                let mut keyed = Vec::with_capacity(items.len());
-                let mut scoped = vars.clone();
-                for item in items {
-                    scoped.insert(*param, item.clone());
-                    keyed.push((eval_expr(key, &scoped, interner)?, item));
-                }
-                keyed.sort_by(|(left, _), (right, _)| compare_json(left, right));
-                current = Value::Array(keyed.into_iter().map(|(_, item)| item).collect());
-            }
-            PipeOp::Limit(count) | PipeOp::Take(count) => {
-                let mut items = take_array(current, "limit")?;
-                let count = as_usize(eval_expr(count, vars, interner)?)?;
-                items.truncate(count);
-                current = Value::Array(items);
-            }
-            PipeOp::Offset(count) => {
-                let items = take_array(current, "offset")?;
-                let count = as_usize(eval_expr(count, vars, interner)?)?;
-                current = Value::Array(items.into_iter().skip(count).collect());
-            }
-            PipeOp::GroupBy { param, key } => {
-                let mut groups = Map::new();
-                let mut scoped = vars.clone();
-                for item in take_array(current, "group_by")? {
-                    scoped.insert(*param, item.clone());
-                    let key = as_string(eval_expr(key, &scoped, interner)?);
-                    groups
-                        .entry(key)
-                        .or_insert_with(|| Value::Array(Vec::new()))
-                        .as_array_mut()
-                        .expect("group bucket should be array")
-                        .push(item);
-                }
-                current = Value::Object(groups);
+            PipeOp::Expr { name, value } => {
+                let name = sym(interner, *name);
+                execute_pipe_expr_op(name, current, value, vars, interner)?
             }
             PipeOp::Reduce {
+                name,
                 initial,
                 acc,
                 param,
                 value,
             } => {
-                let mut acc_value = eval_expr(initial, vars, interner)?;
-                let mut scoped = vars.clone();
-                for item in take_array(current, "reduce")? {
-                    scoped.insert(*acc, acc_value);
-                    scoped.insert(*param, item);
-                    acc_value = eval_expr(value, &scoped, interner)?;
-                }
-                current = acc_value;
+                let name = sym(interner, *name);
+                execute_pipe_reduce_op(name, current, initial, *acc, *param, value, vars, interner)?
             }
-            PipeOp::Count => current = json!(take_array(current, "count")?.len()),
-            PipeOp::Sum { param, value } => {
-                current = json!(
-                    numeric_values(take_array(current, "sum")?, *param, value, vars, interner)?
-                        .into_iter()
-                        .sum::<f64>()
-                );
+            PipeOp::None { name } => {
+                let name = sym(interner, *name);
+                execute_pipe_none_op(name, current)?
             }
-            PipeOp::Avg { param, value } => {
-                let values =
-                    numeric_values(take_array(current, "avg")?, *param, value, vars, interner)?;
-                current = json!(if values.is_empty() {
-                    0.0
-                } else {
-                    values.iter().sum::<f64>() / values.len() as f64
-                });
-            }
-            PipeOp::Min { param, value } => {
-                let values =
-                    numeric_values(take_array(current, "min")?, *param, value, vars, interner)?;
-                current = values
-                    .into_iter()
-                    .reduce(f64::min)
-                    .map_or(Value::Null, |value| json!(value));
-            }
-            PipeOp::Max { param, value } => {
-                let values =
-                    numeric_values(take_array(current, "max")?, *param, value, vars, interner)?;
-                current = values
-                    .into_iter()
-                    .reduce(f64::max)
-                    .map_or(Value::Null, |value| json!(value));
-            }
-            PipeOp::Unique { param, key } => {
-                let mut seen = BTreeSet::<String>::new();
-                let mut unique = Vec::new();
-                let mut scoped = vars.clone();
-                for item in take_array(current, "unique")? {
-                    scoped.insert(*param, item.clone());
-                    let key = eval_expr(key, &scoped, interner)?;
-                    let key = serde_json::to_string(&key).map_err(|err| {
-                        RuntimeError::Execution(format!("failed to serialize unique key: {err}"))
-                    })?;
-                    if seen.insert(key) {
-                        unique.push(item);
-                    }
-                }
-                current = Value::Array(unique);
-            }
-            PipeOp::FlatMap { param, value } => {
-                let mut flattened = Vec::new();
-                let mut scoped = vars.clone();
-                for item in take_array(current, "flat_map")? {
-                    scoped.insert(*param, item);
-                    match eval_expr(value, &scoped, interner)? {
-                        Value::Array(items) => flattened.extend(items),
-                        value => flattened.push(value),
-                    }
-                }
-                current = Value::Array(flattened);
-            }
-            PipeOp::First => {
-                current = take_array(current, "first")?
-                    .into_iter()
-                    .next()
-                    .unwrap_or(Value::Null);
-            }
-            PipeOp::Last => {
-                current = take_array(current, "last")?
-                    .into_iter()
-                    .last()
-                    .unwrap_or(Value::Null);
-            }
-        }
+        };
     }
 
     Ok(current)
+}
+
+macro_rules! runtime_pipe_ops {
+    (
+        closure { $($closure_name:literal => $closure_handler:ident,)* }
+        expr { $($expr_name:literal => $expr_handler:ident,)* }
+        none { $($none_name:literal => $none_handler:ident,)* }
+        reduce { $($reduce_name:literal => $reduce_handler:ident,)* }
+    ) => {
+        fn execute_pipe_closure_op(
+            name: &str,
+            current: Value,
+            param: Sym,
+            value: &Expression,
+            vars: &Vars,
+            interner: &Rodeo,
+        ) -> RuntimeResult<Value> {
+            match name {
+                $($closure_name => $closure_handler(current, param, value, vars, interner),)*
+                _ => Err(RuntimeError::Execution(format!(
+                    "unsupported pipe closure operation `{name}`"
+                ))),
+            }
+        }
+
+        fn execute_pipe_expr_op(
+            name: &str,
+            current: Value,
+            value: &Expression,
+            vars: &Vars,
+            interner: &Rodeo,
+        ) -> RuntimeResult<Value> {
+            match name {
+                $($expr_name => $expr_handler(name, current, value, vars, interner),)*
+                _ => Err(RuntimeError::Execution(format!(
+                    "unsupported pipe expression operation `{name}`"
+                ))),
+            }
+        }
+
+        fn execute_pipe_none_op(name: &str, current: Value) -> RuntimeResult<Value> {
+            match name {
+                $($none_name => $none_handler(current),)*
+                _ => Err(RuntimeError::Execution(format!(
+                    "unsupported pipe operation `{name}`"
+                ))),
+            }
+        }
+
+        fn execute_pipe_reduce_op(
+            name: &str,
+            current: Value,
+            initial: &Expression,
+            acc: Sym,
+            param: Sym,
+            value: &Expression,
+            vars: &Vars,
+            interner: &Rodeo,
+        ) -> RuntimeResult<Value> {
+            match name {
+                $($reduce_name => $reduce_handler(current, initial, acc, param, value, vars, interner),)*
+                _ => Err(RuntimeError::Execution(format!(
+                    "unsupported pipe reduce operation `{name}`"
+                ))),
+            }
+        }
+    };
+}
+
+runtime_pipe_ops! {
+    // To add a DSL pipe operation, implement a handler with the matching shape
+    // and register its parsed name here; no grammar or lexer change is needed.
+    closure {
+        "filter" => pipe_filter,
+        "map" => pipe_map,
+        "sort" => pipe_sort,
+        "group_by" => pipe_group_by,
+        "sum" => pipe_sum,
+        "avg" => pipe_avg,
+        "min" => pipe_min,
+        "max" => pipe_max,
+        "unique" => pipe_unique,
+        "flat_map" => pipe_flat_map,
+    }
+    expr {
+        "limit" => pipe_limit,
+        "take" => pipe_limit,
+        "offset" => pipe_offset,
+    }
+    none {
+        "count" => pipe_count,
+        "first" => pipe_first,
+        "last" => pipe_last,
+    }
+    reduce {
+        "reduce" => pipe_reduce,
+    }
+}
+
+fn pipe_filter(
+    current: Value,
+    param: Sym,
+    value: &Expression,
+    vars: &Vars,
+    interner: &Rodeo,
+) -> RuntimeResult<Value> {
+    let items = take_array(current, "filter")?;
+    let mut filtered = Vec::new();
+    let mut scoped = vars.clone();
+    for item in items {
+        scoped.insert(param, item.clone());
+        if truthy(&eval_expr(value, &scoped, interner)?) {
+            filtered.push(item);
+        }
+    }
+    Ok(Value::Array(filtered))
+}
+
+fn pipe_map(
+    current: Value,
+    param: Sym,
+    value: &Expression,
+    vars: &Vars,
+    interner: &Rodeo,
+) -> RuntimeResult<Value> {
+    let items = take_array(current, "map")?;
+    let mut mapped = Vec::with_capacity(items.len());
+    let mut scoped = vars.clone();
+    for item in items {
+        scoped.insert(param, item);
+        mapped.push(eval_expr(value, &scoped, interner)?);
+    }
+    Ok(Value::Array(mapped))
+}
+
+fn pipe_sort(
+    current: Value,
+    param: Sym,
+    value: &Expression,
+    vars: &Vars,
+    interner: &Rodeo,
+) -> RuntimeResult<Value> {
+    let items = take_array(current, "sort")?;
+    let mut keyed = Vec::with_capacity(items.len());
+    let mut scoped = vars.clone();
+    for item in items {
+        scoped.insert(param, item.clone());
+        keyed.push((eval_expr(value, &scoped, interner)?, item));
+    }
+    keyed.sort_by(|(left, _), (right, _)| compare_json(left, right));
+    Ok(Value::Array(
+        keyed.into_iter().map(|(_, item)| item).collect(),
+    ))
+}
+
+fn pipe_group_by(
+    current: Value,
+    param: Sym,
+    value: &Expression,
+    vars: &Vars,
+    interner: &Rodeo,
+) -> RuntimeResult<Value> {
+    let mut groups = Map::new();
+    let mut scoped = vars.clone();
+    for item in take_array(current, "group_by")? {
+        scoped.insert(param, item.clone());
+        let key = as_string(eval_expr(value, &scoped, interner)?);
+        groups
+            .entry(key)
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .expect("group bucket should be array")
+            .push(item);
+    }
+    Ok(Value::Object(groups))
+}
+
+fn pipe_sum(
+    current: Value,
+    param: Sym,
+    value: &Expression,
+    vars: &Vars,
+    interner: &Rodeo,
+) -> RuntimeResult<Value> {
+    Ok(json!(
+        numeric_values(take_array(current, "sum")?, param, value, vars, interner)?
+            .into_iter()
+            .sum::<f64>()
+    ))
+}
+
+fn pipe_avg(
+    current: Value,
+    param: Sym,
+    value: &Expression,
+    vars: &Vars,
+    interner: &Rodeo,
+) -> RuntimeResult<Value> {
+    let values = numeric_values(take_array(current, "avg")?, param, value, vars, interner)?;
+    Ok(json!(if values.is_empty() {
+        0.0
+    } else {
+        values.iter().sum::<f64>() / values.len() as f64
+    }))
+}
+
+fn pipe_min(
+    current: Value,
+    param: Sym,
+    value: &Expression,
+    vars: &Vars,
+    interner: &Rodeo,
+) -> RuntimeResult<Value> {
+    let values = numeric_values(take_array(current, "min")?, param, value, vars, interner)?;
+    Ok(values
+        .into_iter()
+        .reduce(f64::min)
+        .map_or(Value::Null, |value| json!(value)))
+}
+
+fn pipe_max(
+    current: Value,
+    param: Sym,
+    value: &Expression,
+    vars: &Vars,
+    interner: &Rodeo,
+) -> RuntimeResult<Value> {
+    let values = numeric_values(take_array(current, "max")?, param, value, vars, interner)?;
+    Ok(values
+        .into_iter()
+        .reduce(f64::max)
+        .map_or(Value::Null, |value| json!(value)))
+}
+
+fn pipe_unique(
+    current: Value,
+    param: Sym,
+    value: &Expression,
+    vars: &Vars,
+    interner: &Rodeo,
+) -> RuntimeResult<Value> {
+    let mut seen = BTreeSet::<String>::new();
+    let mut unique = Vec::new();
+    let mut scoped = vars.clone();
+    for item in take_array(current, "unique")? {
+        scoped.insert(param, item.clone());
+        let key = eval_expr(value, &scoped, interner)?;
+        let key = serde_json::to_string(&key).map_err(|err| {
+            RuntimeError::Execution(format!("failed to serialize unique key: {err}"))
+        })?;
+        if seen.insert(key) {
+            unique.push(item);
+        }
+    }
+    Ok(Value::Array(unique))
+}
+
+fn pipe_flat_map(
+    current: Value,
+    param: Sym,
+    value: &Expression,
+    vars: &Vars,
+    interner: &Rodeo,
+) -> RuntimeResult<Value> {
+    let mut flattened = Vec::new();
+    let mut scoped = vars.clone();
+    for item in take_array(current, "flat_map")? {
+        scoped.insert(param, item);
+        match eval_expr(value, &scoped, interner)? {
+            Value::Array(items) => flattened.extend(items),
+            value => flattened.push(value),
+        }
+    }
+    Ok(Value::Array(flattened))
+}
+
+fn pipe_limit(
+    name: &str,
+    current: Value,
+    value: &Expression,
+    vars: &Vars,
+    interner: &Rodeo,
+) -> RuntimeResult<Value> {
+    let mut items = take_array(current, name)?;
+    let count = as_usize(eval_expr(value, vars, interner)?)?;
+    items.truncate(count);
+    Ok(Value::Array(items))
+}
+
+fn pipe_offset(
+    _name: &str,
+    current: Value,
+    value: &Expression,
+    vars: &Vars,
+    interner: &Rodeo,
+) -> RuntimeResult<Value> {
+    let items = take_array(current, "offset")?;
+    let count = as_usize(eval_expr(value, vars, interner)?)?;
+    Ok(Value::Array(items.into_iter().skip(count).collect()))
+}
+
+fn pipe_count(current: Value) -> RuntimeResult<Value> {
+    Ok(json!(take_array(current, "count")?.len()))
+}
+
+fn pipe_first(current: Value) -> RuntimeResult<Value> {
+    Ok(take_array(current, "first")?
+        .into_iter()
+        .next()
+        .unwrap_or(Value::Null))
+}
+
+fn pipe_last(current: Value) -> RuntimeResult<Value> {
+    Ok(take_array(current, "last")?
+        .into_iter()
+        .last()
+        .unwrap_or(Value::Null))
+}
+
+fn pipe_reduce(
+    current: Value,
+    initial: &Expression,
+    acc: Sym,
+    param: Sym,
+    value: &Expression,
+    vars: &Vars,
+    interner: &Rodeo,
+) -> RuntimeResult<Value> {
+    let mut acc_value = eval_expr(initial, vars, interner)?;
+    let mut scoped = vars.clone();
+    for item in take_array(current, "reduce")? {
+        scoped.insert(acc, acc_value);
+        scoped.insert(param, item);
+        acc_value = eval_expr(value, &scoped, interner)?;
+    }
+    Ok(acc_value)
 }
 
 fn numeric_values(

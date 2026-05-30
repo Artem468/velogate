@@ -22,32 +22,14 @@ export function syncPipeConfig(config, changedField = null) {
 
 function pipeOpCode(op) {
     switch (op.kind) {
-        case 'filter':
-            return `filter(${op.param} => ${formatPipeExpr(op.condition)})`;
-        case 'map':
-            return `map(${op.param} => ${formatPipeExpr(op.value)})`;
-        case 'sort':
-            return `sort(${op.param} => ${formatPipeExpr(op.key)})`;
-        case 'group_by':
-            return `group_by(${op.param} => ${formatPipeExpr(op.key)})`;
-        case 'sum':
-        case 'avg':
-        case 'min':
-        case 'max':
-        case 'flat_map':
-            return `${op.kind}(${op.param} => ${formatPipeExpr(op.value)})`;
-        case 'unique':
-            return `unique(${op.param} => ${formatPipeExpr(op.key)})`;
-        case 'limit':
-        case 'offset':
-        case 'take':
-            return `${op.kind}(${formatPipeExpr(op.count)})`;
+        case 'closure':
+            return `${op.name}(${op.param} => ${formatPipeExpr(op.value)})`;
+        case 'expr':
+            return `${op.name}(${formatPipeExpr(op.value)})`;
         case 'reduce':
-            return `reduce(${formatPipeExpr(op.initial)}, ${op.acc}, ${op.param} => ${formatPipeExpr(op.value)})`;
-        case 'count':
-        case 'first':
-        case 'last':
-            return op.kind;
+            return `${op.name}(${formatPipeExpr(op.initial)}, ${op.acc}, ${op.param} => ${formatPipeExpr(op.value)})`;
+        case 'none':
+            return `${op.name}()`;
         default:
             return op.kind;
     }

@@ -88,7 +88,7 @@ fn normalize_span(span: Range<usize>, source_len: usize) -> Range<usize> {
 #[cfg(test)]
 mod tests {
     use super::Parser;
-    use crate::ast::{EndpointOption, Expression, Step};
+    use crate::ast::{EndpointOption, Expression, PipeOp, Step};
     use lasso::Rodeo;
 
     #[test]
@@ -338,7 +338,8 @@ mod tests {
                     "env": body.env_file,
                     "checks": jwt.checks,
                     "command": body.command,
-                    "sync": body.sync
+                    "sync": body.sync,
+                    "method_call": body.method()
                 }
             }
         "#;
@@ -347,6 +348,35 @@ mod tests {
         parser
             .parse(source)
             .expect("config keywords should work as property names");
+    }
+
+    #[test]
+    fn pipe_operation_names_are_generic_identifiers() {
+        let source = r#"
+            gateway "api" { port: 8080 }
+
+            endpoint "GET /x" {
+                let result = items
+                    | custom_filter(item => item.method)
+                    | custom_limit(2)
+                    | custom_count()
+                    | custom_reduce(0, acc, item => acc + item.score);
+                respond 200 { "result": result }
+            }
+        "#;
+
+        let mut parser = Parser::new(Rodeo::new());
+        let ast = parser
+            .parse(source)
+            .expect("generic pipe names should parse");
+
+        let Step::Pipe { operations, .. } = &ast.endpoints[0].steps[0] else {
+            panic!("step should be pipe");
+        };
+        assert!(matches!(operations[0], PipeOp::Closure { .. }));
+        assert!(matches!(operations[1], PipeOp::Expr { .. }));
+        assert!(matches!(operations[2], PipeOp::None { .. }));
+        assert!(matches!(operations[3], PipeOp::Reduce { .. }));
     }
 
     #[test]

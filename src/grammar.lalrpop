@@ -252,20 +252,39 @@ IdentLike: String = {
     "constants" => "constants".to_string(),
     "command" => "command".to_string(),
     "sync" => "sync".to_string(),
-    "sort" => "sort".to_string(),
-    "limit" => "limit".to_string(),
-    "offset" => "offset".to_string(),
-    "group_by" => "group_by".to_string(),
-    "reduce" => "reduce".to_string(),
-    "count" => "count".to_string(),
-    "sum" => "sum".to_string(),
-    "avg" => "avg".to_string(),
-    "min" => "min".to_string(),
-    "max" => "max".to_string(),
-    "unique" => "unique".to_string(),
-    "flat_map" => "flat_map".to_string(),
-    "first" => "first".to_string(),
-    "last" => "last".to_string(),
+};
+
+FieldLike: String = {
+    <value:IdentLike> => value,
+    "gateway" => "gateway".to_string(),
+    "endpoint" => "endpoint".to_string(),
+    "databases" => "databases".to_string(),
+    "protos" => "protos".to_string(),
+    "port" => "port".to_string(),
+    "host" => "host".to_string(),
+    "url" => "url".to_string(),
+    "path" => "path".to_string(),
+    "secure" => "secure".to_string(),
+    "rate_limit" => "rate_limit".to_string(),
+    "let" => "let".to_string(),
+    "fetch" => "fetch".to_string(),
+    "db" => "db".to_string(),
+    "query" => "query".to_string(),
+    "env" => "env".to_string(),
+    "grpc" => "grpc".to_string(),
+    "call" => "call".to_string(),
+    "as" => "as".to_string(),
+    "respond" => "respond".to_string(),
+    "timeout" => "timeout".to_string(),
+    "retry" => "retry".to_string(),
+    "times" => "times".to_string(),
+    "delay" => "delay".to_string(),
+    "fallback" => "fallback".to_string(),
+    "method" => "method".to_string(),
+    "body" => "body".to_string(),
+    "headers" => "headers".to_string(),
+    "cookies" => "cookies".to_string(),
+    "window" => "window".to_string(),
 };
 
 Step: Step = {
@@ -380,48 +399,29 @@ DbQueryParams: Vec<Expression> = {
 };
 
 PipeOp: PipeOp = {
-    "|" <op:PipeClosureOp> "(" <param:IdentLike> "=>" <value:Expression> ")" => {
-        op.build(interner.get_or_intern(&param), value)
-    },
-    "|" <op:PipeExprOp> "(" <value:Expression> ")" => op.build(value),
-    "|" <op:PipeNoneOp> "(" ")" => op.build(),
-    "|" <op:PipeReduceOp> "(" <initial:Expression> "," <acc:IdentLike> "," <param:IdentLike> "=>" <value:Expression> ")" => {
-        op.build(
-            initial,
-            interner.get_or_intern(&acc),
-            interner.get_or_intern(&param),
+    "|" <name:IdentLike> "(" <param:IdentLike> "=>" <value:Expression> ")" => {
+        PipeOp::Closure {
+            name: interner.get_or_intern(&name),
+            param: interner.get_or_intern(&param),
             value,
-        )
+        }
     },
-};
-
-PipeClosureOp: PipeClosureOp = {
-    "filter" => PipeClosureOp::from_keyword("filter").unwrap(),
-    "map" => PipeClosureOp::from_keyword("map").unwrap(),
-    "sort" => PipeClosureOp::from_keyword("sort").unwrap(),
-    "group_by" => PipeClosureOp::from_keyword("group_by").unwrap(),
-    "sum" => PipeClosureOp::from_keyword("sum").unwrap(),
-    "avg" => PipeClosureOp::from_keyword("avg").unwrap(),
-    "min" => PipeClosureOp::from_keyword("min").unwrap(),
-    "max" => PipeClosureOp::from_keyword("max").unwrap(),
-    "unique" => PipeClosureOp::from_keyword("unique").unwrap(),
-    "flat_map" => PipeClosureOp::from_keyword("flat_map").unwrap(),
-};
-
-PipeExprOp: PipeExprOp = {
-    "limit" => PipeExprOp::from_keyword("limit").unwrap(),
-    "offset" => PipeExprOp::from_keyword("offset").unwrap(),
-    "take" => PipeExprOp::from_keyword("take").unwrap(),
-};
-
-PipeNoneOp: PipeNoneOp = {
-    "count" => PipeNoneOp::from_keyword("count").unwrap(),
-    "first" => PipeNoneOp::from_keyword("first").unwrap(),
-    "last" => PipeNoneOp::from_keyword("last").unwrap(),
-};
-
-PipeReduceOp: PipeReduceOp = {
-    "reduce" => PipeReduceOp::from_keyword("reduce").unwrap(),
+    "|" <name:IdentLike> "(" <value:Expression> ")" => PipeOp::Expr {
+        name: interner.get_or_intern(&name),
+        value,
+    },
+    "|" <name:IdentLike> "(" ")" => PipeOp::None {
+        name: interner.get_or_intern(&name),
+    },
+    "|" <name:IdentLike> "(" <initial:Expression> "," <acc:IdentLike> "," <param:IdentLike> "=>" <value:Expression> ")" => {
+        PipeOp::Reduce {
+            name: interner.get_or_intern(&name),
+            initial,
+            acc: interner.get_or_intern(&acc),
+            param: interner.get_or_intern(&param),
+            value,
+        }
+    },
 };
 
 FetchConfigBlock: TailConfig = {
@@ -524,7 +524,7 @@ Factor: Expression = {
 };
 
 Postfix: Expression = {
-    <e:Postfix> "." <field:IdentLike> => Expression::PropertyAccess(Box::new(e), interner.get_or_intern(&field)),
+    <e:Postfix> "." <field:FieldLike> => Expression::PropertyAccess(Box::new(e), interner.get_or_intern(&field)),
     <e:Postfix> "(" <args:CallArgs> ")" => Expression::Call { callee: Box::new(e), args },
     Primary
 };
@@ -548,7 +548,7 @@ Primary: Expression = {
 };
 
 PathExpr: Expression = {
-    <head:IdentLike> <tail:("::" <IdentLike>)*> => {
+    <head:IdentLike> <tail:("::" <FieldLike>)*> => {
         let mut expr = Expression::Variable(interner.get_or_intern(&head));
         for item in tail {
             expr = Expression::PropertyAccess(Box::new(expr), interner.get_or_intern(&item));
@@ -604,23 +604,6 @@ extern {
         "body" => Token::Body,
         "headers" => Token::Headers,
         "cookies" => Token::Cookies,
-        "filter" => Token::Filter,
-        "map" => Token::Map,
-        "take" => Token::Take,
-        "sort" => Token::Sort,
-        "limit" => Token::Limit,
-        "offset" => Token::Offset,
-        "group_by" => Token::GroupBy,
-        "reduce" => Token::Reduce,
-        "count" => Token::Count,
-        "sum" => Token::Sum,
-        "avg" => Token::Avg,
-        "min" => Token::Min,
-        "max" => Token::Max,
-        "unique" => Token::Unique,
-        "flat_map" => Token::FlatMap,
-        "first" => Token::First,
-        "last" => Token::Last,
         "sync" => Token::Sync,
         "window" => Token::Window,
         "true" => Token::True,

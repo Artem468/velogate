@@ -10,9 +10,10 @@ gateway "VeloGate-BFF" {
 }
 
 endpoint "GET /api/v1/todos" {
-    rate_limit: 100/rps window 1s,
+    rate_limit: 100/rps window 1000ms,
 
     fetch todos_api + "/todos" as raw_todos {
+        method: "GET",
         timeout: 500ms,
         retry: 2 times,
         delay: 10ms,
@@ -23,15 +24,15 @@ endpoint "GET /api/v1/todos" {
     | filter(t => t.id > 10 && t.id < 20)
     | map(t => {
         "id": t.id,
-        "user_id": t.userId,
-        "title": t.title
+        "title": t.title,
+        "user_id": t.userId
     })
     | take(default_take);
 
     respond 200 {
-        "service": service_name,
+        "data": completed_todos,
         "default_take": default_take,
-        "data": completed_todos
+        "service": service_name
     }
 }
 

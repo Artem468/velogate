@@ -252,21 +252,13 @@ fn collect_step_reads(step: &Step, reads: &mut HashSet<Sym>) {
 
 fn collect_pipe_op_reads(op: &PipeOp, reads: &mut HashSet<Sym>) {
     match op {
-        PipeOp::Filter { param, condition } => collect_bound_expr_reads(*param, condition, reads),
-        PipeOp::Map { param, value }
-        | PipeOp::Sort { param, key: value }
-        | PipeOp::GroupBy { param, key: value }
-        | PipeOp::Sum { param, value }
-        | PipeOp::Avg { param, value }
-        | PipeOp::Min { param, value }
-        | PipeOp::Max { param, value }
-        | PipeOp::Unique { param, key: value }
-        | PipeOp::FlatMap { param, value } => collect_bound_expr_reads(*param, value, reads),
+        PipeOp::Closure { param, value, .. } => collect_bound_expr_reads(*param, value, reads),
         PipeOp::Reduce {
             initial,
             acc,
             param,
             value,
+            ..
         } => {
             collect_expr_reads(initial, reads, &HashSet::new());
             let mut bound = HashSet::new();
@@ -274,10 +266,10 @@ fn collect_pipe_op_reads(op: &PipeOp, reads: &mut HashSet<Sym>) {
             bound.insert(*param);
             collect_expr_reads(value, reads, &bound);
         }
-        PipeOp::Take(count) | PipeOp::Limit(count) | PipeOp::Offset(count) => {
-            collect_expr_reads(count, reads, &HashSet::new());
+        PipeOp::Expr { value, .. } => {
+            collect_expr_reads(value, reads, &HashSet::new());
         }
-        PipeOp::Count | PipeOp::First | PipeOp::Last => {}
+        PipeOp::None { .. } => {}
     }
 }
 

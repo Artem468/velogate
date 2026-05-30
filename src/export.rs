@@ -134,63 +134,24 @@ pub struct DbQueryConfigExport {
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PipeOpExport {
-    Filter {
-        param: String,
-        condition: ExprExport,
-    },
-    Map {
+    Closure {
+        name: String,
         param: String,
         value: ExprExport,
     },
-    Sort {
-        param: String,
-        key: ExprExport,
+    Expr {
+        name: String,
+        value: ExprExport,
     },
-    Limit {
-        count: ExprExport,
-    },
-    Offset {
-        count: ExprExport,
-    },
-    GroupBy {
-        param: String,
-        key: ExprExport,
+    None {
+        name: String,
     },
     Reduce {
+        name: String,
         initial: ExprExport,
         acc: String,
         param: String,
         value: ExprExport,
-    },
-    Count,
-    Sum {
-        param: String,
-        value: ExprExport,
-    },
-    Avg {
-        param: String,
-        value: ExprExport,
-    },
-    Min {
-        param: String,
-        value: ExprExport,
-    },
-    Max {
-        param: String,
-        value: ExprExport,
-    },
-    Unique {
-        param: String,
-        key: ExprExport,
-    },
-    FlatMap {
-        param: String,
-        value: ExprExport,
-    },
-    First,
-    Last,
-    Take {
-        count: ExprExport,
     },
 }
 
@@ -694,68 +655,30 @@ fn export_endpoint_option(option: &EndpointOption, interner: &Rodeo) -> Endpoint
 
 fn export_pipe_op(op: &PipeOp, interner: &Rodeo) -> PipeOpExport {
     match op {
-        PipeOp::Filter { param, condition } => PipeOpExport::Filter {
-            param: sym(interner, *param),
-            condition: export_expr(condition, interner),
-        },
-        PipeOp::Map { param, value } => PipeOpExport::Map {
+        PipeOp::Closure { name, param, value } => PipeOpExport::Closure {
+            name: sym(interner, *name),
             param: sym(interner, *param),
             value: export_expr(value, interner),
         },
-        PipeOp::Sort { param, key } => PipeOpExport::Sort {
-            param: sym(interner, *param),
-            key: export_expr(key, interner),
+        PipeOp::Expr { name, value } => PipeOpExport::Expr {
+            name: sym(interner, *name),
+            value: export_expr(value, interner),
         },
-        PipeOp::Limit(count) => PipeOpExport::Limit {
-            count: export_expr(count, interner),
-        },
-        PipeOp::Offset(count) => PipeOpExport::Offset {
-            count: export_expr(count, interner),
-        },
-        PipeOp::GroupBy { param, key } => PipeOpExport::GroupBy {
-            param: sym(interner, *param),
-            key: export_expr(key, interner),
+        PipeOp::None { name } => PipeOpExport::None {
+            name: sym(interner, *name),
         },
         PipeOp::Reduce {
+            name,
             initial,
             acc,
             param,
             value,
         } => PipeOpExport::Reduce {
+            name: sym(interner, *name),
             initial: export_expr(initial, interner),
             acc: sym(interner, *acc),
             param: sym(interner, *param),
             value: export_expr(value, interner),
-        },
-        PipeOp::Count => PipeOpExport::Count,
-        PipeOp::Sum { param, value } => PipeOpExport::Sum {
-            param: sym(interner, *param),
-            value: export_expr(value, interner),
-        },
-        PipeOp::Avg { param, value } => PipeOpExport::Avg {
-            param: sym(interner, *param),
-            value: export_expr(value, interner),
-        },
-        PipeOp::Min { param, value } => PipeOpExport::Min {
-            param: sym(interner, *param),
-            value: export_expr(value, interner),
-        },
-        PipeOp::Max { param, value } => PipeOpExport::Max {
-            param: sym(interner, *param),
-            value: export_expr(value, interner),
-        },
-        PipeOp::Unique { param, key } => PipeOpExport::Unique {
-            param: sym(interner, *param),
-            key: export_expr(key, interner),
-        },
-        PipeOp::FlatMap { param, value } => PipeOpExport::FlatMap {
-            param: sym(interner, *param),
-            value: export_expr(value, interner),
-        },
-        PipeOp::First => PipeOpExport::First,
-        PipeOp::Last => PipeOpExport::Last,
-        PipeOp::Take(count) => PipeOpExport::Take {
-            count: export_expr(count, interner),
         },
     }
 }
@@ -844,18 +767,7 @@ fn step_var_and_deps(step: &Step, interner: &Rodeo) -> (String, Vec<String>) {
 
 fn collect_pipe_op_deps(op: &PipeOp, interner: &Rodeo, deps: &mut Vec<String>) {
     match op {
-        PipeOp::Filter { param, condition } => {
-            collect_bound_expr_deps(*param, condition, interner, deps)
-        }
-        PipeOp::Map { param, value }
-        | PipeOp::Sort { param, key: value }
-        | PipeOp::GroupBy { param, key: value }
-        | PipeOp::Sum { param, value }
-        | PipeOp::Avg { param, value }
-        | PipeOp::Min { param, value }
-        | PipeOp::Max { param, value }
-        | PipeOp::Unique { param, key: value }
-        | PipeOp::FlatMap { param, value } => {
+        PipeOp::Closure { param, value, .. } => {
             collect_bound_expr_deps(*param, value, interner, deps);
         }
         PipeOp::Reduce {
@@ -863,6 +775,7 @@ fn collect_pipe_op_deps(op: &PipeOp, interner: &Rodeo, deps: &mut Vec<String>) {
             acc,
             param,
             value,
+            ..
         } => {
             collect_expr_deps(initial, interner, deps);
             collect_expr_deps(value, interner, deps);
@@ -870,10 +783,10 @@ fn collect_pipe_op_deps(op: &PipeOp, interner: &Rodeo, deps: &mut Vec<String>) {
             let param = sym(interner, *param);
             deps.retain(|dep| dep != &acc && dep != &param);
         }
-        PipeOp::Take(count) | PipeOp::Limit(count) | PipeOp::Offset(count) => {
-            collect_expr_deps(count, interner, deps);
+        PipeOp::Expr { value, .. } => {
+            collect_expr_deps(value, interner, deps);
         }
-        PipeOp::Count | PipeOp::First | PipeOp::Last => {}
+        PipeOp::None { .. } => {}
     }
 }
 

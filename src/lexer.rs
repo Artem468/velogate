@@ -90,40 +90,6 @@ pub(crate) enum Token {
     #[token("cookies")]
     Cookies,
 
-    #[token("filter")]
-    Filter,
-    #[token("map")]
-    Map,
-    #[token("take")]
-    Take,
-    #[token("sort")]
-    Sort,
-    #[token("limit")]
-    Limit,
-    #[token("offset")]
-    Offset,
-    #[token("group_by")]
-    GroupBy,
-    #[token("reduce")]
-    Reduce,
-    #[token("count")]
-    Count,
-    #[token("sum")]
-    Sum,
-    #[token("avg")]
-    Avg,
-    #[token("min")]
-    Min,
-    #[token("max")]
-    Max,
-    #[token("unique")]
-    Unique,
-    #[token("flat_map")]
-    FlatMap,
-    #[token("first")]
-    First,
-    #[token("last")]
-    Last,
     #[token("sync")]
     Sync,
 
