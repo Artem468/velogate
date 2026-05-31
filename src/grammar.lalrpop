@@ -94,7 +94,7 @@ Endpoint: Endpoint = {
         let mut sync_boundaries = Vec::new();
         for item in items {
             match item {
-                EndpointBodyItem::Step(step) => steps.push(step),
+                EndpointBodyItem::Step(step) => steps.push(*step),
                 EndpointBodyItem::Sync(sync_steps) => {
                     let block_start = steps.len();
                     if block_start > 0 {
@@ -389,7 +389,7 @@ Step: Step = {
 };
 
 EndpointBodyItem: EndpointBodyItem = {
-    <step:Step> => EndpointBodyItem::Step(step),
+    <step:Step> => EndpointBodyItem::Step(Box::new(step)),
     "sync" "{" <steps:Step*> "}" => EndpointBodyItem::Sync(steps),
 };
 

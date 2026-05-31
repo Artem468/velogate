@@ -50,7 +50,7 @@ where
 
         Box::pin(async move {
             let key = client_ip_key(&request);
-            if rate_limited(&policy, &key).await {
+            if rate_limited(&policy, &key) {
                 let body = json!({
                     "error": "rate_limited",
                     "message": "request rate limit exceeded",

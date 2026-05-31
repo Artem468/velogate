@@ -242,7 +242,7 @@ pub(crate) enum SecureRuleConfigEntry {
 
 #[derive(Debug, Clone)]
 pub(crate) enum EndpointBodyItem {
-    Step(Step),
+    Step(Box<Step>),
     Sync(Vec<Step>),
 }
 

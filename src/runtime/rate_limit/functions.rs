@@ -1,15 +1,13 @@
 use super::types::{RateLimitPolicy, RateLimitState};
 use crate::ast::{Endpoint, EndpointOption};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 use tokio::time::Instant;
 
-pub(super) async fn rate_limited(policy: &RateLimitPolicy, key: &str) -> bool {
-    let mut states = policy.states.lock().await;
+pub(super) fn rate_limited(policy: &RateLimitPolicy, key: &str) -> bool {
     let now = Instant::now();
-    let state = states
+    let mut state = policy
+        .states
         .entry(key.to_string())
         .or_insert_with(|| RateLimitState {
             started_at: now,
@@ -36,7 +34,7 @@ pub(crate) fn endpoint_rate_limit_policy(endpoint: &Endpoint) -> Option<RateLimi
         } => Some(RateLimitPolicy {
             limit: *limit,
             window: Duration::from_millis(*window_ms),
-            states: Arc::new(Mutex::new(HashMap::new())),
+            states: Arc::new(dashmap::DashMap::new()),
         }),
         EndpointOption::Secure(_) => None,
     })

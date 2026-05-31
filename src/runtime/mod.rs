@@ -10,6 +10,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::on;
 use axum::{Json, Router};
+use dashmap::DashMap;
 use lasso::Rodeo;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
 use prost_types::{ListValue, Struct, Value as ProstValue, value::Kind};
@@ -24,7 +25,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command as ProcessCommand;
-use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tonic::client::Grpc;
 use tonic::transport::{Channel, Endpoint as TonicEndpoint};
@@ -38,8 +38,8 @@ mod traits;
 mod types;
 
 use functions::{
-    axum_route_path, db_urls, gateway_vars, insert_value_var, method_filter, proto_paths,
-    request_body_value, request_vars, sym,
+    axum_route_path, db_urls, gateway_vars, insert_request_vars, insert_value_var, method_filter,
+    proto_paths, request_body_value, sym,
 };
 use rate_limit::{VelogateRateLimitLayer, endpoint_rate_limit_policy};
 use security::authorize_endpoint;
@@ -64,8 +64,8 @@ impl Runtime {
             interner: Arc::new(interner),
             plan: Arc::new(plan),
             client: Client::new(),
-            db_pools: Arc::new(Mutex::new(HashMap::new())),
-            proto_pools: Arc::new(Mutex::new(HashMap::new())),
+            db_pools: Arc::new(DashMap::new()),
+            proto_pools: Arc::new(DashMap::new()),
         }
     }
 
@@ -176,13 +176,15 @@ impl EndpointRuntime {
         let endpoint = format!("{} {}", self.endpoint.method, self.endpoint.path);
         debug!(%endpoint, "handling request");
         let mut vars = self.static_vars.clone();
-        vars.extend(request_vars(
+        vars.reserve(path_params.len() + 4);
+        insert_request_vars(
+            &mut vars,
             &path_params,
             &query_params,
             &headers,
             body,
             &self.interner,
-        ));
+        );
 
         if let Err(err) = authorize_endpoint(&self.endpoint, &mut vars, &headers, &self.interner) {
             warn!(%endpoint, message = %err.message, "request rejected by security rule");
@@ -420,7 +422,7 @@ async fn query_db(
     vars: &Vars,
     interner: &Rodeo,
     db_urls: &HashMap<String, String>,
-    db_pools: &Mutex<HashMap<String, AnyPool>>,
+    db_pools: &DashMap<String, AnyPool>,
 ) -> RuntimeResult<Value> {
     let source = as_string(eval_expr(&config.db_source, vars, interner)?);
     let url = db_urls.get(&source).cloned().unwrap_or(source);
@@ -465,13 +467,10 @@ async fn query_db(
     }
 }
 
-async fn get_db_pool(
-    url: &str,
-    db_pools: &Mutex<HashMap<String, AnyPool>>,
-) -> RuntimeResult<AnyPool> {
+async fn get_db_pool(url: &str, db_pools: &DashMap<String, AnyPool>) -> RuntimeResult<AnyPool> {
     SQLX_DRIVERS.call_once(install_default_drivers);
 
-    if let Some(pool) = db_pools.lock().await.get(url).cloned() {
+    if let Some(pool) = db_pools.get(url).map(|pool| pool.clone()) {
         return Ok(pool);
     }
 
@@ -480,8 +479,10 @@ async fn get_db_pool(
         .connect(url)
         .await
         .map_err(|err| RuntimeError::Database(format!("failed to connect to database: {err}")))?;
-    db_pools.lock().await.insert(url.to_string(), pool.clone());
-    Ok(pool)
+    Ok(db_pools
+        .entry(url.to_string())
+        .or_insert_with(|| pool.clone())
+        .clone())
 }
 
 fn bind_json_value<'q>(
@@ -507,7 +508,7 @@ fn bind_json_value<'q>(
 }
 
 fn row_to_json(row: sqlx::any::AnyRow) -> RuntimeResult<Value> {
-    let mut object = Map::new();
+    let mut object = Map::with_capacity(row.columns().len());
 
     for (idx, column) in row.columns().iter().enumerate() {
         let value = decode_column(&row, idx).map_err(|err| {
@@ -551,7 +552,7 @@ async fn call_grpc(
     vars: &Vars,
     interner: &Rodeo,
     proto_paths: &HashMap<String, String>,
-    proto_pools: &Mutex<HashMap<String, DescriptorPool>>,
+    proto_pools: &DashMap<String, DescriptorPool>,
 ) -> RuntimeResult<Value> {
     let payload = eval_expr(&config.payload, vars, interner)?;
 
@@ -612,7 +613,7 @@ async fn call_grpc_dynamic(
     config: &GrpcConfig,
     payload: Value,
     proto_paths: &HashMap<String, String>,
-    proto_pools: &Mutex<HashMap<String, DescriptorPool>>,
+    proto_pools: &DashMap<String, DescriptorPool>,
 ) -> RuntimeResult<Value> {
     let proto_source = config
         .proto_path
@@ -664,7 +665,7 @@ async fn load_grpc_method(
     proto_path: &str,
     service_name: &str,
     method_name: &str,
-    proto_pools: &Mutex<HashMap<String, DescriptorPool>>,
+    proto_pools: &DashMap<String, DescriptorPool>,
 ) -> RuntimeResult<prost_reflect::MethodDescriptor> {
     let pool = get_proto_pool(proto_path, proto_pools).await?;
     let service = pool.get_service_by_name(service_name).ok_or_else(|| {
@@ -683,9 +684,9 @@ async fn load_grpc_method(
 
 async fn get_proto_pool(
     proto_path: &str,
-    proto_pools: &Mutex<HashMap<String, DescriptorPool>>,
+    proto_pools: &DashMap<String, DescriptorPool>,
 ) -> RuntimeResult<DescriptorPool> {
-    if let Some(pool) = proto_pools.lock().await.get(proto_path).cloned() {
+    if let Some(pool) = proto_pools.get(proto_path).map(|pool| pool.clone()) {
         return Ok(pool);
     }
 
@@ -697,11 +698,10 @@ async fn get_proto_pool(
     let pool = DescriptorPool::from_file_descriptor_set(descriptor_set).map_err(|err| {
         RuntimeError::Execution(format!("failed to load proto descriptors: {err}"))
     })?;
-    proto_pools
-        .lock()
-        .await
-        .insert(proto_path.to_string(), pool.clone());
-    Ok(pool)
+    Ok(proto_pools
+        .entry(proto_path.to_string())
+        .or_insert_with(|| pool.clone())
+        .clone())
 }
 
 fn dynamic_message_from_json(

@@ -5,6 +5,7 @@ use axum::http::{HeaderMap, header};
 use axum::routing::MethodFilter;
 use lasso::Rodeo;
 use serde_json::Map;
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 pub(super) fn gateway_vars(ast: &FileAST, interner: &Rodeo) -> RuntimeResult<Vars> {
@@ -48,7 +49,7 @@ fn parse_env_file(contents: &str) -> Map<String, Value> {
     contents
         .lines()
         .filter_map(parse_env_line)
-        .map(|(key, value)| (normalize_key(&key), Value::String(value)))
+        .map(|(key, value)| (normalize_key(&key).into_owned(), Value::String(value)))
         .collect()
 }
 
@@ -77,27 +78,21 @@ fn unquote_env_value(value: &str) -> String {
     }
 }
 
-pub(super) fn request_vars(
+pub(super) fn insert_request_vars(
+    vars: &mut Vars,
     path_params: &HashMap<String, String>,
     query_params: &HashMap<String, String>,
     headers: &HeaderMap,
     body: Value,
     interner: &Rodeo,
-) -> Vars {
-    let mut vars = Vars::new();
-
+) {
     for (key, value) in path_params {
-        insert_string_var(&mut vars, interner, key, value.clone());
+        insert_string_var(vars, interner, key, value.clone());
     }
 
+    insert_object_var(vars, interner, "query", normalized_object(query_params));
     insert_object_var(
-        &mut vars,
-        interner,
-        "query",
-        normalized_object(query_params),
-    );
-    insert_object_var(
-        &mut vars,
+        vars,
         interner,
         "headers",
         headers
@@ -105,7 +100,7 @@ pub(super) fn request_vars(
             .filter_map(|(name, value)| {
                 value.to_str().ok().map(|value| {
                     (
-                        normalize_key(name.as_str()),
+                        normalize_key(name.as_str()).into_owned(),
                         Value::String(value.to_string()),
                     )
                 })
@@ -113,7 +108,7 @@ pub(super) fn request_vars(
             .collect(),
     );
     insert_object_var(
-        &mut vars,
+        vars,
         interner,
         "cookies",
         headers
@@ -125,8 +120,6 @@ pub(super) fn request_vars(
     if let Some(sym) = interner.get("body") {
         vars.insert(sym, body);
     }
-
-    vars
 }
 
 pub(super) fn request_body_value(body: &Bytes) -> Value {
@@ -157,10 +150,14 @@ pub(super) fn insert_value_var(vars: &mut Vars, interner: &Rodeo, name: &str, va
 }
 
 fn normalized_object(params: &HashMap<String, String>) -> Map<String, Value> {
-    params
-        .iter()
-        .map(|(key, value)| (normalize_key(key), Value::String(value.clone())))
-        .collect()
+    let mut object = Map::with_capacity(params.len());
+    for (key, value) in params {
+        object.insert(
+            normalize_key(key).into_owned(),
+            Value::String(value.clone()),
+        );
+    }
+    object
 }
 
 fn parse_cookies(header: &str) -> Map<String, Value> {
@@ -168,25 +165,37 @@ fn parse_cookies(header: &str) -> Map<String, Value> {
         .split(';')
         .filter_map(|part| {
             let (key, value) = part.trim().split_once('=')?;
-            Some((normalize_key(key), Value::String(value.to_string())))
+            Some((
+                normalize_key(key).into_owned(),
+                Value::String(value.to_string()),
+            ))
         })
         .collect()
 }
 
-pub(super) fn normalize_key(key: &str) -> String {
-    key.replace('-', "_")
+pub(super) fn normalize_key(key: &str) -> Cow<'_, str> {
+    if key.as_bytes().contains(&b'-') {
+        Cow::Owned(key.replace('-', "_"))
+    } else {
+        Cow::Borrowed(key)
+    }
 }
 
 pub(super) fn axum_route_path(path: &str) -> String {
-    path.split('/')
-        .map(|segment| {
-            segment
-                .strip_prefix(':')
-                .map(|name| format!("{{{name}}}"))
-                .unwrap_or_else(|| segment.to_string())
-        })
-        .collect::<Vec<_>>()
-        .join("/")
+    let mut out = String::with_capacity(path.len());
+    for (idx, segment) in path.split('/').enumerate() {
+        if idx > 0 {
+            out.push('/');
+        }
+        if let Some(name) = segment.strip_prefix(':') {
+            out.push('{');
+            out.push_str(name);
+            out.push('}');
+        } else {
+            out.push_str(segment);
+        }
+    }
+    out
 }
 
 pub(super) fn db_urls(ast: &FileAST, interner: &Rodeo) -> HashMap<String, String> {
