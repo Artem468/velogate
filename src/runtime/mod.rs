@@ -802,14 +802,20 @@ fn execute_pipe(
     let mut current = eval_expr(source, vars, interner)?;
 
     for op in operations {
-        current = match op {
+        let (name, invocation) = match op {
             PipeOp::Closure { name, param, value } => {
                 let name = sym(interner, *name);
-                execute_pipe_closure_op(name, current, *param, value, vars, interner)?
+                (
+                    name,
+                    PipeInvocation::Closure {
+                        param: *param,
+                        value,
+                    },
+                )
             }
             PipeOp::Expr { name, value } => {
                 let name = sym(interner, *name);
-                execute_pipe_expr_op(name, current, value, vars, interner)?
+                (name, PipeInvocation::Expr { value })
             }
             PipeOp::Reduce {
                 name,
@@ -819,127 +825,176 @@ fn execute_pipe(
                 value,
             } => {
                 let name = sym(interner, *name);
-                execute_pipe_reduce_op(name, current, initial, *acc, *param, value, vars, interner)?
+                (
+                    name,
+                    PipeInvocation::Reduce {
+                        initial,
+                        acc: *acc,
+                        param: *param,
+                        value,
+                    },
+                )
             }
             PipeOp::None { name } => {
                 let name = sym(interner, *name);
-                execute_pipe_none_op(name, current)?
+                (name, PipeInvocation::None)
             }
         };
+        current = execute_pipe_op(PipeRuntimeCtx {
+            name,
+            current,
+            invocation,
+            vars,
+            interner,
+        })?;
     }
 
     Ok(current)
 }
 
+enum PipeInvocation<'a> {
+    Closure {
+        param: Sym,
+        value: &'a Expression,
+    },
+    Expr {
+        value: &'a Expression,
+    },
+    None,
+    Reduce {
+        initial: &'a Expression,
+        acc: Sym,
+        param: Sym,
+        value: &'a Expression,
+    },
+}
+
+struct PipeRuntimeCtx<'a> {
+    name: &'a str,
+    current: Value,
+    invocation: PipeInvocation<'a>,
+    vars: &'a Vars,
+    interner: &'a Rodeo,
+}
+
+impl<'a> PipeRuntimeCtx<'a> {
+    fn shape_name(&self) -> &'static str {
+        match self.invocation {
+            PipeInvocation::Closure { .. } => "closure",
+            PipeInvocation::Expr { .. } => "expression",
+            PipeInvocation::None => "empty",
+            PipeInvocation::Reduce { .. } => "reduce",
+        }
+    }
+
+    fn closure(self) -> RuntimeResult<(Value, Sym, &'a Expression, &'a Vars, &'a Rodeo)> {
+        match self.invocation {
+            PipeInvocation::Closure { param, value } => {
+                Ok((self.current, param, value, self.vars, self.interner))
+            }
+            _ => Err(self.invalid_shape("closure")),
+        }
+    }
+
+    fn expr(self) -> RuntimeResult<(&'a str, Value, &'a Expression, &'a Vars, &'a Rodeo)> {
+        match self.invocation {
+            PipeInvocation::Expr { value } => {
+                Ok((self.name, self.current, value, self.vars, self.interner))
+            }
+            _ => Err(self.invalid_shape("expression")),
+        }
+    }
+
+    fn none(self) -> RuntimeResult<Value> {
+        match self.invocation {
+            PipeInvocation::None => Ok(self.current),
+            _ => Err(self.invalid_shape("empty")),
+        }
+    }
+
+    fn reduce(
+        self,
+    ) -> RuntimeResult<(
+        Value,
+        &'a Expression,
+        Sym,
+        Sym,
+        &'a Expression,
+        &'a Vars,
+        &'a Rodeo,
+    )> {
+        match self.invocation {
+            PipeInvocation::Reduce {
+                initial,
+                acc,
+                param,
+                value,
+            } => Ok((
+                self.current,
+                initial,
+                acc,
+                param,
+                value,
+                self.vars,
+                self.interner,
+            )),
+            _ => Err(self.invalid_shape("reduce")),
+        }
+    }
+
+    fn invalid_shape(&self, expected: &str) -> RuntimeError {
+        RuntimeError::Execution(format!(
+            "pipe operation `{}` expects {expected} syntax, got {} syntax",
+            self.name,
+            self.shape_name()
+        ))
+    }
+}
+
 macro_rules! runtime_pipe_ops {
-    (
-        closure { $($closure_name:literal => $closure_handler:ident,)* }
-        expr { $($expr_name:literal => $expr_handler:ident,)* }
-        none { $($none_name:literal => $none_handler:ident,)* }
-        reduce { $($reduce_name:literal => $reduce_handler:ident,)* }
-    ) => {
-        fn execute_pipe_closure_op(
-            name: &str,
-            current: Value,
-            param: Sym,
-            value: &Expression,
-            vars: &Vars,
-            interner: &Rodeo,
-        ) -> RuntimeResult<Value> {
-            match name {
-                $($closure_name => $closure_handler(current, param, value, vars, interner),)*
-                _ => Err(RuntimeError::Execution(format!(
-                    "unsupported pipe closure operation `{name}`"
-                ))),
-            }
-        }
-
-        fn execute_pipe_expr_op(
-            name: &str,
-            current: Value,
-            value: &Expression,
-            vars: &Vars,
-            interner: &Rodeo,
-        ) -> RuntimeResult<Value> {
-            match name {
-                $($expr_name => $expr_handler(name, current, value, vars, interner),)*
-                _ => Err(RuntimeError::Execution(format!(
-                    "unsupported pipe expression operation `{name}`"
-                ))),
-            }
-        }
-
-        fn execute_pipe_none_op(name: &str, current: Value) -> RuntimeResult<Value> {
-            match name {
-                $($none_name => $none_handler(current),)*
-                _ => Err(RuntimeError::Execution(format!(
-                    "unsupported pipe operation `{name}`"
-                ))),
-            }
-        }
-
-        fn execute_pipe_reduce_op(
-            name: &str,
-            current: Value,
-            initial: &Expression,
-            acc: Sym,
-            param: Sym,
-            value: &Expression,
-            vars: &Vars,
-            interner: &Rodeo,
-        ) -> RuntimeResult<Value> {
-            match name {
-                $($reduce_name => $reduce_handler(current, initial, acc, param, value, vars, interner),)*
-                _ => Err(RuntimeError::Execution(format!(
-                    "unsupported pipe reduce operation `{name}`"
-                ))),
+    ($($name:literal => $handler:ident,)*) => {
+        fn execute_pipe_op(ctx: PipeRuntimeCtx<'_>) -> RuntimeResult<Value> {
+            match ctx.name {
+                $($name => $handler(ctx),)*
+                _ => {
+                    let name = ctx.name;
+                    let shape = ctx.shape_name();
+                    Err(RuntimeError::Execution(format!(
+                        "unsupported pipe {shape} operation `{name}`"
+                    )))
+                }
             }
         }
     };
 }
 
 runtime_pipe_ops! {
-    // To add a DSL pipe operation, implement a handler with the matching shape
-    // and register its parsed name here; no grammar or lexer change is needed.
-    closure {
-        "filter" => pipe_filter,
-        "map" => pipe_map,
-        "sort" => pipe_sort,
-        "group_by" => pipe_group_by,
-        "sum" => pipe_sum,
-        "avg" => pipe_avg,
-        "min" => pipe_min,
-        "max" => pipe_max,
-        "unique" => pipe_unique,
-        "flat_map" => pipe_flat_map,
-    }
-    expr {
-        "limit" => pipe_limit,
-        "take" => pipe_limit,
-        "offset" => pipe_offset,
-    }
-    none {
-        "count" => pipe_count,
-        "first" => pipe_first,
-        "last" => pipe_last,
-    }
-    reduce {
-        "reduce" => pipe_reduce,
-    }
+    "filter" => pipe_filter,
+    "map" => pipe_map,
+    "sort" => pipe_sort,
+    "group_by" => pipe_group_by,
+    "sum" => pipe_sum,
+    "avg" => pipe_avg,
+    "min" => pipe_min,
+    "max" => pipe_max,
+    "unique" => pipe_unique,
+    "flat_map" => pipe_flat_map,
+    "limit" => pipe_limit,
+    "take" => pipe_limit,
+    "offset" => pipe_offset,
+    "count" => pipe_count,
+    "first" => pipe_first,
+    "last" => pipe_last,
+    "reduce" => pipe_reduce,
 }
 
-fn pipe_filter(
-    current: Value,
-    param: Sym,
-    value: &Expression,
-    vars: &Vars,
-    interner: &Rodeo,
-) -> RuntimeResult<Value> {
+fn pipe_filter(ctx: PipeRuntimeCtx<'_>) -> RuntimeResult<Value> {
+    let (current, param, value, vars, interner) = ctx.closure()?;
     let items = take_array(current, "filter")?;
     let mut filtered = Vec::new();
-    let mut scoped = vars.clone();
+    let mut scoped = ScopedVars::with_capacity(vars, 1);
     for item in items {
-        scoped.insert(param, item.clone());
+        scoped.set(param, item.clone());
         if truthy(&eval_expr(value, &scoped, interner)?) {
             filtered.push(item);
         }
@@ -947,35 +1002,25 @@ fn pipe_filter(
     Ok(Value::Array(filtered))
 }
 
-fn pipe_map(
-    current: Value,
-    param: Sym,
-    value: &Expression,
-    vars: &Vars,
-    interner: &Rodeo,
-) -> RuntimeResult<Value> {
+fn pipe_map(ctx: PipeRuntimeCtx<'_>) -> RuntimeResult<Value> {
+    let (current, param, value, vars, interner) = ctx.closure()?;
     let items = take_array(current, "map")?;
     let mut mapped = Vec::with_capacity(items.len());
-    let mut scoped = vars.clone();
+    let mut scoped = ScopedVars::with_capacity(vars, 1);
     for item in items {
-        scoped.insert(param, item);
+        scoped.set(param, item);
         mapped.push(eval_expr(value, &scoped, interner)?);
     }
     Ok(Value::Array(mapped))
 }
 
-fn pipe_sort(
-    current: Value,
-    param: Sym,
-    value: &Expression,
-    vars: &Vars,
-    interner: &Rodeo,
-) -> RuntimeResult<Value> {
+fn pipe_sort(ctx: PipeRuntimeCtx<'_>) -> RuntimeResult<Value> {
+    let (current, param, value, vars, interner) = ctx.closure()?;
     let items = take_array(current, "sort")?;
     let mut keyed = Vec::with_capacity(items.len());
-    let mut scoped = vars.clone();
+    let mut scoped = ScopedVars::with_capacity(vars, 1);
     for item in items {
-        scoped.insert(param, item.clone());
+        scoped.set(param, item.clone());
         keyed.push((eval_expr(value, &scoped, interner)?, item));
     }
     keyed.sort_by(|(left, _), (right, _)| compare_json(left, right));
@@ -984,17 +1029,12 @@ fn pipe_sort(
     ))
 }
 
-fn pipe_group_by(
-    current: Value,
-    param: Sym,
-    value: &Expression,
-    vars: &Vars,
-    interner: &Rodeo,
-) -> RuntimeResult<Value> {
+fn pipe_group_by(ctx: PipeRuntimeCtx<'_>) -> RuntimeResult<Value> {
+    let (current, param, value, vars, interner) = ctx.closure()?;
     let mut groups = Map::new();
-    let mut scoped = vars.clone();
+    let mut scoped = ScopedVars::with_capacity(vars, 1);
     for item in take_array(current, "group_by")? {
-        scoped.insert(param, item.clone());
+        scoped.set(param, item.clone());
         let key = as_string(eval_expr(value, &scoped, interner)?);
         groups
             .entry(key)
@@ -1006,75 +1046,48 @@ fn pipe_group_by(
     Ok(Value::Object(groups))
 }
 
-fn pipe_sum(
-    current: Value,
-    param: Sym,
-    value: &Expression,
-    vars: &Vars,
-    interner: &Rodeo,
-) -> RuntimeResult<Value> {
+fn pipe_sum(ctx: PipeRuntimeCtx<'_>) -> RuntimeResult<Value> {
+    let (current, param, value, vars, interner) = ctx.closure()?;
     Ok(json!(
-        numeric_values(take_array(current, "sum")?, param, value, vars, interner)?
-            .into_iter()
-            .sum::<f64>()
+        numeric_stats(take_array(current, "sum")?, param, value, vars, interner)?.sum
     ))
 }
 
-fn pipe_avg(
-    current: Value,
-    param: Sym,
-    value: &Expression,
-    vars: &Vars,
-    interner: &Rodeo,
-) -> RuntimeResult<Value> {
-    let values = numeric_values(take_array(current, "avg")?, param, value, vars, interner)?;
-    Ok(json!(if values.is_empty() {
+fn pipe_avg(ctx: PipeRuntimeCtx<'_>) -> RuntimeResult<Value> {
+    let (current, param, value, vars, interner) = ctx.closure()?;
+    let stats = numeric_stats(take_array(current, "avg")?, param, value, vars, interner)?;
+    Ok(json!(if stats.count == 0 {
         0.0
     } else {
-        values.iter().sum::<f64>() / values.len() as f64
+        stats.sum / stats.count as f64
     }))
 }
 
-fn pipe_min(
-    current: Value,
-    param: Sym,
-    value: &Expression,
-    vars: &Vars,
-    interner: &Rodeo,
-) -> RuntimeResult<Value> {
-    let values = numeric_values(take_array(current, "min")?, param, value, vars, interner)?;
-    Ok(values
-        .into_iter()
-        .reduce(f64::min)
-        .map_or(Value::Null, |value| json!(value)))
+fn pipe_min(ctx: PipeRuntimeCtx<'_>) -> RuntimeResult<Value> {
+    let (current, param, value, vars, interner) = ctx.closure()?;
+    Ok(
+        numeric_stats(take_array(current, "min")?, param, value, vars, interner)?
+            .min
+            .map_or(Value::Null, |value| json!(value)),
+    )
 }
 
-fn pipe_max(
-    current: Value,
-    param: Sym,
-    value: &Expression,
-    vars: &Vars,
-    interner: &Rodeo,
-) -> RuntimeResult<Value> {
-    let values = numeric_values(take_array(current, "max")?, param, value, vars, interner)?;
-    Ok(values
-        .into_iter()
-        .reduce(f64::max)
-        .map_or(Value::Null, |value| json!(value)))
+fn pipe_max(ctx: PipeRuntimeCtx<'_>) -> RuntimeResult<Value> {
+    let (current, param, value, vars, interner) = ctx.closure()?;
+    Ok(
+        numeric_stats(take_array(current, "max")?, param, value, vars, interner)?
+            .max
+            .map_or(Value::Null, |value| json!(value)),
+    )
 }
 
-fn pipe_unique(
-    current: Value,
-    param: Sym,
-    value: &Expression,
-    vars: &Vars,
-    interner: &Rodeo,
-) -> RuntimeResult<Value> {
+fn pipe_unique(ctx: PipeRuntimeCtx<'_>) -> RuntimeResult<Value> {
+    let (current, param, value, vars, interner) = ctx.closure()?;
     let mut seen = BTreeSet::<String>::new();
     let mut unique = Vec::new();
-    let mut scoped = vars.clone();
+    let mut scoped = ScopedVars::with_capacity(vars, 1);
     for item in take_array(current, "unique")? {
-        scoped.insert(param, item.clone());
+        scoped.set(param, item.clone());
         let key = eval_expr(value, &scoped, interner)?;
         let key = serde_json::to_string(&key).map_err(|err| {
             RuntimeError::Execution(format!("failed to serialize unique key: {err}"))
@@ -1086,17 +1099,12 @@ fn pipe_unique(
     Ok(Value::Array(unique))
 }
 
-fn pipe_flat_map(
-    current: Value,
-    param: Sym,
-    value: &Expression,
-    vars: &Vars,
-    interner: &Rodeo,
-) -> RuntimeResult<Value> {
+fn pipe_flat_map(ctx: PipeRuntimeCtx<'_>) -> RuntimeResult<Value> {
+    let (current, param, value, vars, interner) = ctx.closure()?;
     let mut flattened = Vec::new();
-    let mut scoped = vars.clone();
+    let mut scoped = ScopedVars::with_capacity(vars, 1);
     for item in take_array(current, "flat_map")? {
-        scoped.insert(param, item);
+        scoped.set(param, item);
         match eval_expr(value, &scoped, interner)? {
             Value::Array(items) => flattened.extend(items),
             value => flattened.push(value),
@@ -1105,82 +1113,84 @@ fn pipe_flat_map(
     Ok(Value::Array(flattened))
 }
 
-fn pipe_limit(
-    name: &str,
-    current: Value,
-    value: &Expression,
-    vars: &Vars,
-    interner: &Rodeo,
-) -> RuntimeResult<Value> {
+fn pipe_limit(ctx: PipeRuntimeCtx<'_>) -> RuntimeResult<Value> {
+    let (name, current, value, vars, interner) = ctx.expr()?;
     let mut items = take_array(current, name)?;
     let count = as_usize(eval_expr(value, vars, interner)?)?;
     items.truncate(count);
     Ok(Value::Array(items))
 }
 
-fn pipe_offset(
-    _name: &str,
-    current: Value,
-    value: &Expression,
-    vars: &Vars,
-    interner: &Rodeo,
-) -> RuntimeResult<Value> {
+fn pipe_offset(ctx: PipeRuntimeCtx<'_>) -> RuntimeResult<Value> {
+    let (_, current, value, vars, interner) = ctx.expr()?;
     let items = take_array(current, "offset")?;
     let count = as_usize(eval_expr(value, vars, interner)?)?;
     Ok(Value::Array(items.into_iter().skip(count).collect()))
 }
 
-fn pipe_count(current: Value) -> RuntimeResult<Value> {
+fn pipe_count(ctx: PipeRuntimeCtx<'_>) -> RuntimeResult<Value> {
+    let current = ctx.none()?;
     Ok(json!(take_array(current, "count")?.len()))
 }
 
-fn pipe_first(current: Value) -> RuntimeResult<Value> {
+fn pipe_first(ctx: PipeRuntimeCtx<'_>) -> RuntimeResult<Value> {
+    let current = ctx.none()?;
     Ok(take_array(current, "first")?
         .into_iter()
         .next()
         .unwrap_or(Value::Null))
 }
 
-fn pipe_last(current: Value) -> RuntimeResult<Value> {
+fn pipe_last(ctx: PipeRuntimeCtx<'_>) -> RuntimeResult<Value> {
+    let current = ctx.none()?;
     Ok(take_array(current, "last")?
         .into_iter()
         .last()
         .unwrap_or(Value::Null))
 }
 
-fn pipe_reduce(
-    current: Value,
-    initial: &Expression,
-    acc: Sym,
-    param: Sym,
-    value: &Expression,
-    vars: &Vars,
-    interner: &Rodeo,
-) -> RuntimeResult<Value> {
+fn pipe_reduce(ctx: PipeRuntimeCtx<'_>) -> RuntimeResult<Value> {
+    let (current, initial, acc, param, value, vars, interner) = ctx.reduce()?;
     let mut acc_value = eval_expr(initial, vars, interner)?;
-    let mut scoped = vars.clone();
+    let mut scoped = ScopedVars::with_capacity(vars, 2);
     for item in take_array(current, "reduce")? {
-        scoped.insert(acc, acc_value);
-        scoped.insert(param, item);
+        scoped.set(acc, acc_value);
+        scoped.set(param, item);
         acc_value = eval_expr(value, &scoped, interner)?;
     }
     Ok(acc_value)
 }
 
-fn numeric_values(
+struct NumericStats {
+    count: usize,
+    sum: f64,
+    min: Option<f64>,
+    max: Option<f64>,
+}
+
+fn numeric_stats(
     items: Vec<Value>,
     param: Sym,
     expr: &Expression,
     vars: &Vars,
     interner: &Rodeo,
-) -> RuntimeResult<Vec<f64>> {
-    let mut values = Vec::with_capacity(items.len());
-    let mut scoped = vars.clone();
+) -> RuntimeResult<NumericStats> {
+    let mut stats = NumericStats {
+        count: 0,
+        sum: 0.0,
+        min: None,
+        max: None,
+    };
+    let mut scoped = ScopedVars::with_capacity(vars, 1);
     for item in items {
-        scoped.insert(param, item);
-        values.push(as_f64(&eval_expr(expr, &scoped, interner)?)?);
+        scoped.set(param, item);
+        let value = as_f64(&eval_expr(expr, &scoped, interner)?)?;
+        stats.count += 1;
+        stats.sum += value;
+        stats.min = Some(stats.min.map_or(value, |min| min.min(value)));
+        stats.max = Some(stats.max.map_or(value, |max| max.max(value)));
     }
-    Ok(values)
+    Ok(stats)
 }
 
 fn compare_json(left: &Value, right: &Value) -> Ordering {
@@ -1268,10 +1278,61 @@ fn error_code(error: &RuntimeError) -> &'static str {
     }
 }
 
-fn eval_expr(expr: &Expression, vars: &Vars, interner: &Rodeo) -> RuntimeResult<Value> {
+trait VarLookup {
+    fn get_var(&self, name: Sym) -> Option<&Value>;
+}
+
+impl VarLookup for Vars {
+    fn get_var(&self, name: Sym) -> Option<&Value> {
+        self.get(&name)
+    }
+}
+
+struct ScopedVars<'a> {
+    base: &'a Vars,
+    bindings: Vec<(Sym, Value)>,
+}
+
+impl<'a> ScopedVars<'a> {
+    fn with_capacity(base: &'a Vars, capacity: usize) -> Self {
+        Self {
+            base,
+            bindings: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn set(&mut self, name: Sym, value: Value) {
+        if let Some((_, existing)) = self
+            .bindings
+            .iter_mut()
+            .rev()
+            .find(|(binding_name, _)| *binding_name == name)
+        {
+            *existing = value;
+        } else {
+            self.bindings.push((name, value));
+        }
+    }
+}
+
+impl VarLookup for ScopedVars<'_> {
+    fn get_var(&self, name: Sym) -> Option<&Value> {
+        self.bindings
+            .iter()
+            .rev()
+            .find_map(|(binding_name, value)| (*binding_name == name).then_some(value))
+            .or_else(|| self.base.get(&name))
+    }
+}
+
+fn eval_expr<V: VarLookup + ?Sized>(
+    expr: &Expression,
+    vars: &V,
+    interner: &Rodeo,
+) -> RuntimeResult<Value> {
     match expr {
         Expression::Null => Ok(Value::Null),
-        Expression::Variable(name) => vars.get(name).cloned().ok_or_else(|| {
+        Expression::Variable(name) => vars.get_var(*name).cloned().ok_or_else(|| {
             RuntimeError::Execution(format!(
                 "undefined runtime variable `{}`",
                 sym(interner, *name)
@@ -1308,7 +1369,7 @@ fn eval_expr(expr: &Expression, vars: &Vars, interner: &Rodeo) -> RuntimeResult<
 fn eval_call(
     callee: &Expression,
     args: &[Expression],
-    vars: &Vars,
+    vars: &(impl VarLookup + ?Sized),
     interner: &Rodeo,
 ) -> RuntimeResult<Value> {
     match callee {
@@ -1329,7 +1390,11 @@ fn eval_call(
     }
 }
 
-fn eval_args(args: &[Expression], vars: &Vars, interner: &Rodeo) -> RuntimeResult<Vec<Value>> {
+fn eval_args(
+    args: &[Expression],
+    vars: &(impl VarLookup + ?Sized),
+    interner: &Rodeo,
+) -> RuntimeResult<Vec<Value>> {
     args.iter()
         .map(|arg| eval_expr(arg, vars, interner))
         .collect()
