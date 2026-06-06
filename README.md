@@ -1,8 +1,23 @@
-# VeloGate
+<p align="center">
+  <img src="assets/icon.png" alt="VeloGate logo" width="220">
+</p>
+
+
+<p align="center">
+  <a href="https://github.com/Artem468/velogate/actions/workflows/ci.yml"><img src="https://github.com/Artem468/velogate/actions/workflows/ci.yml/badge.svg?branch=master" alt="CI status"></a>
+  <a href="https://github.com/Artem468/velogate/actions/workflows/ci.yml"><img src="https://img.shields.io/badge/builds-Linux%20%7C%20Windows-2496ED" alt="Linux and Windows builds"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Artem468/velogate" alt="License"></a>
+</p>
 
 VeloGate - декларативный API gateway/BFF runtime. Он читает `.gate` конфигурацию, строит план выполнения endpoint-а, проверяет зависимости между переменными и запускает HTTP runtime на Axum.
 
 Основная идея: описать входные ручки, внешние HTTP/gRPC/DB вызовы, security, retry/fallback и трансформации JSON в одном `.gate` файле.
+
+## Готовые сборки
+
+CI собирает release-бинарники для Linux x86_64 и Windows x86_64 после успешных Rust и frontend проверок.
+
+Скачать последнюю сборку можно на странице [GitHub Actions](https://github.com/Artem468/velogate/actions/workflows/ci.yml): открыть успешный запуск и выбрать `velogate-linux-x86_64` или `velogate-windows-x86_64` в секции **Artifacts**. Артефакты хранятся 30 дней.
 
 ## Возможности
 
@@ -642,6 +657,26 @@ cargo run -- doctor --config examples/main.gate
 cargo run -- start --config examples/main.gate --workers 4
 ```
 
+Local shell commands are disabled by default. Enable and bound them explicitly:
+
+```powershell
+cargo run -- start --config examples/main.gate --allow-commands --command-timeout-ms 5000 --command-max-concurrency 2 --command-max-output-bytes 262144
+```
+
+Forwarding headers are ignored unless the direct peer belongs to a trusted proxy network:
+
+```powershell
+cargo run -- start --config examples/main.gate --trusted-proxy 10.0.0.0/8,192.168.0.0/16
+```
+
+Optional operational endpoints and bounded rate-limit storage:
+
+```powershell
+cargo run -- start --config examples/main.gate --health-path /healthz --readiness-path /readyz --metrics-path /metrics --rate-limit-max-clients 100000 --rate-limit-cleanup-ms 60000
+```
+
+Runtime errors returned to clients contain a stable error code and request ID. Internal details remain in structured logs.
+
 Start gateway with the embedded visual editor. `--port` is the editor UI port; when it is omitted, the OS assigns a free port and the CLI prints the URL.
 
 ```powershell
@@ -664,7 +699,7 @@ Open `http://127.0.0.1:5173` for websocket hot reload. Set `VELOGATE_EDITOR_API`
 Переопределить env-файл из CLI:
 
 ```powershell
-cargo run -- start --config examples/main.gate --env-file examples/.env
+cargo run -- start --config examples/main.gate --env-file examples/example.env
 ```
 
 Dump AST:
@@ -702,7 +737,7 @@ cargo run --quiet -- dump --config examples/main.gate --format openapi | Out-Fil
 Основной пример:
 
 - `examples/main.gate`
-- `examples/.env`
+- `examples/example.env`
 
 Отдельные кейсы:
 

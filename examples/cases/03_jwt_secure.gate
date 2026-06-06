@@ -1,6 +1,6 @@
 gateway "jwt-secure" {
     port: 8093,
-    env_file: "secure.env"
+    env_file: "secure.example.env"
 }
 
 endpoint "GET /api/v1/users/:id/profile" {

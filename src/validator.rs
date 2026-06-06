@@ -64,6 +64,7 @@ fn validate_endpoints(ast: &FileAST, interner: &Rodeo, errors: &mut Vec<Validati
     let mut routes = HashSet::new();
 
     for endpoint in &ast.endpoints {
+        validate_endpoint_path(endpoint, errors);
         if !is_valid_method(&endpoint.method) {
             push(
                 errors,
@@ -74,12 +75,13 @@ fn validate_endpoints(ast: &FileAST, interner: &Rodeo, errors: &mut Vec<Validati
             );
         }
 
-        if !routes.insert((endpoint.method.as_str(), endpoint.path.as_str())) {
+        let route_pattern = normalized_route_pattern(&endpoint.path);
+        if !routes.insert((endpoint.method.as_str(), route_pattern.clone())) {
             push(
                 errors,
                 format!(
-                    "duplicate endpoint route `{} {}`",
-                    endpoint.method, endpoint.path
+                    "conflicting endpoint route `{} {}`; route pattern `{route_pattern}` is already registered",
+                    endpoint.method, endpoint.path,
                 ),
             );
         }
@@ -119,6 +121,60 @@ fn validate_endpoints(ast: &FileAST, interner: &Rodeo, errors: &mut Vec<Validati
             }
         }
     }
+}
+
+fn validate_endpoint_path(endpoint: &crate::ast::Endpoint, errors: &mut Vec<ValidationError>) {
+    if !endpoint.path.starts_with('/') || endpoint.path.contains(['{', '}', '*']) {
+        push(
+            errors,
+            format!(
+                "endpoint `{} {}` path must be absolute and use `:name` for parameters",
+                endpoint.method, endpoint.path
+            ),
+        );
+    }
+
+    let mut params = HashSet::new();
+    for segment in endpoint
+        .path
+        .split('/')
+        .filter_map(|segment| segment.strip_prefix(':'))
+    {
+        if segment.is_empty()
+            || !segment
+                .chars()
+                .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        {
+            push(
+                errors,
+                format!(
+                    "endpoint `{} {}` has invalid path parameter `:{segment}`",
+                    endpoint.method, endpoint.path
+                ),
+            );
+        } else if !params.insert(segment) {
+            push(
+                errors,
+                format!(
+                    "endpoint `{} {}` repeats path parameter `:{segment}`",
+                    endpoint.method, endpoint.path
+                ),
+            );
+        }
+    }
+}
+
+fn normalized_route_pattern(path: &str) -> String {
+    path.split('/')
+        .map(|segment| {
+            if segment.starts_with(':') || (segment.starts_with('{') && segment.ends_with('}')) {
+                "{}"
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn validate_unique_symbols(
@@ -230,8 +286,23 @@ mod tests {
         assert!(has_error(&errors, "duplicate gateway constant `api`"));
         assert!(has_error(&errors, "duplicate database `main`"));
         assert!(has_error(&errors, "duplicate proto `profile`"));
-        assert!(has_error(&errors, "duplicate endpoint route `GET /x`"));
+        assert!(has_error(&errors, "conflicting endpoint route `GET /x`"));
         assert!(has_error(&errors, "proto.path points to missing file"));
+    }
+
+    #[test]
+    fn rejects_routes_with_equivalent_dynamic_patterns() {
+        let source = r#"
+            gateway "api" { port: 8080 }
+            endpoint "GET /users/:id" { respond 200 {} }
+            endpoint "GET /users/:name" { respond 200 {} }
+        "#;
+
+        let errors = validate(source);
+        assert!(has_error(
+            &errors,
+            "route pattern `/users/{}` is already registered"
+        ));
     }
 
     #[test]

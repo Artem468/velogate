@@ -10,6 +10,7 @@ use axum::http::header::{HeaderName, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
 
@@ -49,8 +50,9 @@ where
         let policy = self.policy.clone();
 
         Box::pin(async move {
-            let key = client_ip_key(&request);
+            let key = client_ip_key(&request, &policy);
             if rate_limited(&policy, &key) {
+                policy.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
                 let body = json!({
                     "error": "rate_limited",
                     "message": "request rate limit exceeded",
@@ -63,15 +65,22 @@ where
     }
 }
 
-fn client_ip_key(request: &RateLimitRequest) -> String {
-    header_ip(request, "x-forwarded-for")
-        .or_else(|| header_ip(request, "x-real-ip"))
-        .or_else(|| {
-            request
-                .extensions()
-                .get::<ConnectInfo<SocketAddr>>()
-                .map(|ConnectInfo(addr)| addr.ip().to_string())
-        })
+fn client_ip_key(request: &RateLimitRequest, policy: &RateLimitPolicy) -> String {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip());
+    let trusted_peer = peer.is_some_and(|ip| {
+        policy
+            .trusted_proxies
+            .iter()
+            .any(|network| network.contains(&ip))
+    });
+
+    trusted_peer
+        .then(|| header_ip(request, "x-forwarded-for").or_else(|| header_ip(request, "x-real-ip")))
+        .flatten()
+        .or_else(|| peer.map(|ip| ip.to_string()))
         .unwrap_or_else(|| "unknown".to_string())
 }
 
@@ -88,5 +97,6 @@ fn header_value_to_ip(value: &HeaderValue) -> Option<String> {
         .next()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+        .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+        .map(|ip| ip.to_string())
 }

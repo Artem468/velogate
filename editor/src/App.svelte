@@ -1,5 +1,4 @@
 <script>
-    import ELK from 'elkjs/lib/elk.bundled.js';
     import {addEdge} from '@xyflow/svelte';
     import {Toaster, toast} from 'svelte-sonner';
     import '@xyflow/svelte/dist/style.css';
@@ -30,7 +29,11 @@
     import {allEndpointIndexes, normalizeVisibleEndpoints, setEndpointIndexVisible} from './lib/endpointVisibility.js';
     import {graphSnapshot as createGraphSnapshot, normalizeGraphPositions} from './lib/graph.js';
 
-    const elk = new ELK();
+    let elkPromise = null;
+    function getElk() {
+        elkPromise ??= import('elkjs/lib/elk.bundled.js').then(({default: ELK}) => new ELK());
+        return elkPromise;
+    }
     const nodeTypes = {gate: GateNode};
 
     let state = null;
@@ -482,6 +485,7 @@
             children: graphNodes.map(({id, width, height}) => ({id, width, height})),
             edges: graphEdges.map((edge) => ({id: edge.id, sources: [edge.source], targets: [edge.target]}))
         };
+        const elk = await getElk();
         const layout = await elk.layout(elkGraph);
         const positions = new Map(layout.children.map((node) => [node.id, {x: node.x, y: node.y}]));
         const nextNodes = graphNodes.map((node) => ({

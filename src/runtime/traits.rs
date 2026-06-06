@@ -103,7 +103,8 @@ impl fmt::Display for RuntimeError {
             | Self::Database(message)
             | Self::Grpc(message)
             | Self::Config(message)
-            | Self::Execution(message) => f.write_str(message),
+            | Self::Execution(message)
+            | Self::RouteConflict(message) => f.write_str(message),
         }
     }
 }

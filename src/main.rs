@@ -10,12 +10,11 @@ use velogate::export::{export_file, export_openapi};
 use velogate::linter::{LintWarning, lint_file};
 use velogate::parser::{ParseDiagnostic, Parser};
 use velogate::planner::{ExecutionPlan, PlanError, build_plan, export_plan_dot};
-use velogate::runtime::Runtime;
+use velogate::runtime::{CommandOptions, RateLimitOptions, Runtime, RuntimeOptions};
 use velogate::validator::{ValidationError, validate_file};
 
 #[derive(ClapParser, Debug)]
 #[command(name = "velogate")]
-#[command(author = "Your Name")]
 #[command(version = "0.1.0")]
 #[command(about = "High-performance declarative API Gateway & BFF compiler", long_about = None)]
 struct Cli {
@@ -81,6 +80,9 @@ struct StartArgs {
     /// Path to an environment config file.
     #[arg(long, value_name = "ENV_FILE")]
     env_file: Option<PathBuf>,
+
+    #[command(flatten)]
+    runtime: RuntimeArgs,
 }
 
 #[derive(Args, Debug)]
@@ -100,6 +102,52 @@ struct DevArgs {
     /// Path to an environment config file.
     #[arg(long, value_name = "ENV_FILE")]
     env_file: Option<PathBuf>,
+
+    #[command(flatten)]
+    runtime: RuntimeArgs,
+}
+
+#[derive(Args, Debug, Clone)]
+struct RuntimeArgs {
+    /// Allow .gate command steps to execute local shell commands.
+    #[arg(long)]
+    allow_commands: bool,
+
+    /// Maximum command execution time.
+    #[arg(long, default_value_t = 30_000)]
+    command_timeout_ms: u64,
+
+    /// Maximum number of commands executing concurrently.
+    #[arg(long, default_value_t = 4)]
+    command_max_concurrency: usize,
+
+    /// Maximum captured bytes for each command stdout/stderr stream.
+    #[arg(long, default_value_t = 1_048_576)]
+    command_max_output_bytes: usize,
+
+    /// Trusted reverse proxy networks allowed to supply forwarding headers.
+    #[arg(long, value_delimiter = ',')]
+    trusted_proxy: Vec<ipnet::IpNet>,
+
+    /// Maximum clients tracked by each endpoint rate limiter.
+    #[arg(long, default_value_t = 100_000)]
+    rate_limit_max_clients: usize,
+
+    /// Minimum interval after which idle rate-limit entries may be removed.
+    #[arg(long, default_value_t = 60_000)]
+    rate_limit_cleanup_ms: u64,
+
+    /// Optional static GET path for a liveness endpoint.
+    #[arg(long)]
+    health_path: Option<String>,
+
+    /// Optional static GET path for a readiness endpoint.
+    #[arg(long)]
+    readiness_path: Option<String>,
+
+    /// Optional static GET path exposing JSON runtime counters.
+    #[arg(long)]
+    metrics_path: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -328,18 +376,23 @@ fn start(args: StartArgs) -> Result<(), ()> {
         eprintln!("failed to initialize Tokio runtime: {err}");
     })?;
 
+    let options = runtime_options(&args.runtime)?;
     rt.block_on(async {
         let actual_workers = tokio::runtime::Handle::current().metrics().num_workers();
         tracing::info!(workers = actual_workers, "velogate runtime started");
 
-        let runtime = Runtime::new(ast, parser.interner, plan);
-        if let Err(err) = runtime.serve().await {
-            tracing::error!(error = %err, "velogate runtime failed");
-        }
-        tracing::info!("velogate runtime stopped");
-    });
-
-    Ok(())
+        let runtime = Runtime::with_options(ast, parser.interner, plan, options);
+        runtime
+            .serve_with_shutdown(async {
+                if let Err(err) = tokio::signal::ctrl_c().await {
+                    tracing::error!(error = %err, "failed to listen for shutdown signal");
+                }
+            })
+            .await
+            .map_err(|err| {
+                tracing::error!(error = %err, "velogate runtime failed");
+            })
+    })
 }
 
 fn dev(args: DevArgs) -> Result<(), ()> {
@@ -354,16 +407,47 @@ fn dev(args: DevArgs) -> Result<(), ()> {
         eprintln!("failed to initialize Tokio runtime: {err}");
     })?;
 
+    let options = runtime_options(&args.runtime)?;
     rt.block_on(async move {
         run_dev_server(DevConfig {
             config_path: args.config,
             env_file: args.env_file,
             ui_port: args.port,
+            runtime_options: options,
         })
         .await
         .map_err(|err| {
             eprintln!("dev server failed: {err}");
         })
+    })
+}
+
+fn runtime_options(args: &RuntimeArgs) -> Result<RuntimeOptions, ()> {
+    if args.command_max_concurrency == 0
+        || args.command_max_output_bytes == 0
+        || args.rate_limit_max_clients == 0
+        || args.command_timeout_ms == 0
+        || args.rate_limit_cleanup_ms == 0
+    {
+        eprintln!("runtime concurrency, output and client limits must be greater than zero");
+        return Err(());
+    }
+
+    Ok(RuntimeOptions {
+        command: CommandOptions {
+            enabled: args.allow_commands,
+            timeout: std::time::Duration::from_millis(args.command_timeout_ms),
+            max_concurrency: args.command_max_concurrency,
+            max_output_bytes: args.command_max_output_bytes,
+        },
+        rate_limit: RateLimitOptions {
+            trusted_proxies: args.trusted_proxy.clone(),
+            max_tracked_clients: args.rate_limit_max_clients,
+            cleanup_interval: std::time::Duration::from_millis(args.rate_limit_cleanup_ms),
+        },
+        health_path: args.health_path.clone(),
+        readiness_path: args.readiness_path.clone(),
+        metrics_path: args.metrics_path.clone(),
     })
 }
 

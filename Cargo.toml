@@ -27,6 +27,7 @@ serde_json = "1.0"
 jsonwebtoken = "9.3"
 base64 = "0.22"
 dashmap = "6.1"
+ipnet = "2.11"
 
 tower = { version = "0.5.3", features = ["util"] }
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "any", "postgres", "mysql", "sqlite"] }

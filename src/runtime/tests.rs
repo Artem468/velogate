@@ -1,7 +1,8 @@
-use super::Runtime;
+use super::{Runtime, RuntimeOptions};
 use crate::parser::Parser;
 use crate::planner::build_plan;
 use axum::body::to_bytes;
+use axum::extract::ConnectInfo;
 use axum::http::header::SET_COOKIE;
 use axum::http::{Request, StatusCode};
 use base64::Engine;
@@ -10,6 +11,7 @@ use jsonwebtoken::{EncodingKey, Header, encode};
 use lasso::Rodeo;
 use serde_json::{Value, json};
 use std::fs;
+use std::net::SocketAddr;
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -361,7 +363,7 @@ async fn rate_limit_endpoint_returns_429_after_limit() {
 }
 
 #[tokio::test]
-async fn rate_limit_is_tracked_per_client_ip() {
+async fn untrusted_forwarding_headers_do_not_bypass_rate_limit() {
     let source = r#"
             gateway "test" { port: 0 }
 
@@ -409,7 +411,40 @@ async fn rate_limit_is_tracked_per_client_ip() {
         )
         .await
         .expect("route should respond");
-    assert_eq!(other_ip.status(), StatusCode::OK);
+    assert_eq!(other_ip.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn trusted_proxy_forwarding_headers_select_client_ip() {
+    let source = r#"
+        gateway "test" { port: 0 }
+        endpoint "GET /limited" {
+            rate_limit: 1/rps window 1s,
+            respond 200 { "ok": true }
+        }
+    "#;
+    let mut options = RuntimeOptions::default();
+    options.rate_limit.trusted_proxies = vec!["127.0.0.0/8".parse().expect("valid network")];
+    let router = test_router_with_options(source, options);
+
+    for client in ["10.0.0.1", "10.0.0.2"] {
+        let mut request = Request::builder()
+            .uri("/limited")
+            .header("x-forwarded-for", client)
+            .body(axum::body::Body::empty())
+            .expect("request should build");
+        request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:12345"
+                .parse::<SocketAddr>()
+                .expect("valid socket address"),
+        ));
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("route should respond");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }
 
 #[tokio::test]
@@ -787,7 +822,9 @@ async fn command_step_exposes_status_stdout_and_stderr() {
             }
         }
     "#;
-    let router = test_router(source);
+    let mut options = RuntimeOptions::default();
+    options.command.enabled = true;
+    let router = test_router_with_options(source, options);
 
     let response = router
         .oneshot(
@@ -809,11 +846,93 @@ async fn command_step_exposes_status_stdout_and_stderr() {
     assert_eq!(body["stderr"], "");
 }
 
-fn test_router(source: &str) -> axum::Router {
+#[tokio::test]
+async fn command_is_disabled_by_default_and_internal_error_is_hidden() {
+    let source = r#"
+        gateway "api" { port: 8080 }
+        endpoint "GET /command" {
+            command "echo hidden" as shell;
+            respond 200 { "stdout": shell.stdout }
+        }
+    "#;
+    let response = test_router(source)
+        .oneshot(
+            Request::builder()
+                .uri("/command")
+                .body(axum::body::Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("route should respond");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("body should read");
+    let body: Value = serde_json::from_slice(&body).expect("body should be JSON");
+    assert_eq!(body["message"], "internal server error");
+    assert!(body["request_id"].as_str().is_some());
+    assert!(!body.to_string().contains("command execution is disabled"));
+}
+
+#[tokio::test]
+async fn operational_endpoints_are_configurable() {
+    let source = r#"gateway "api" { port: 8080 }"#;
+    let options = RuntimeOptions {
+        health_path: Some("/healthz".to_string()),
+        metrics_path: Some("/metrics".to_string()),
+        ..RuntimeOptions::default()
+    };
+    let router = test_router_with_options(source, options);
+
+    let health = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(axum::body::Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("health should respond");
+    assert_eq!(health.status(), StatusCode::OK);
+
+    let metrics = router
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(axum::body::Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("metrics should respond");
+    assert_eq!(metrics.status(), StatusCode::OK);
+}
+
+#[test]
+fn router_rejects_equivalent_dynamic_routes_without_panicking() {
+    let source = r#"
+        gateway "api" { port: 8080 }
+        endpoint "GET /users/:id" { respond 200 {} }
+        endpoint "GET /users/:name" { respond 200 {} }
+    "#;
     let mut parser = Parser::new(Rodeo::new());
     let ast = parser.parse(source).expect("test DSL should parse");
     let plan = build_plan(&ast, &parser.interner).expect("test DSL should plan");
-    Runtime::new(ast, parser.interner, plan)
+    let error = Runtime::new(ast, parser.interner, plan)
+        .router()
+        .expect_err("conflicting routes should fail");
+    assert!(error.to_string().contains("conflicting route"));
+}
+
+fn test_router(source: &str) -> axum::Router {
+    test_router_with_options(source, RuntimeOptions::default())
+}
+
+fn test_router_with_options(source: &str, options: RuntimeOptions) -> axum::Router {
+    let mut parser = Parser::new(Rodeo::new());
+    let ast = parser.parse(source).expect("test DSL should parse");
+    let plan = build_plan(&ast, &parser.interner).expect("test DSL should plan");
+    Runtime::with_options(ast, parser.interner, plan, options)
         .router()
         .expect("router should build")
 }

@@ -5,6 +5,7 @@ use dashmap::DashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -13,6 +14,12 @@ pub(crate) struct RateLimitPolicy {
     pub(super) limit: u32,
     pub(super) window: Duration,
     pub(super) states: Arc<DashMap<String, RateLimitState>>,
+    pub(super) trusted_proxies: Arc<Vec<ipnet::IpNet>>,
+    pub(super) max_tracked_clients: usize,
+    pub(super) cleanup_after: Duration,
+    pub(super) calls: Arc<AtomicU64>,
+    pub(super) tracked_clients: Arc<AtomicUsize>,
+    pub(super) metrics: Arc<crate::runtime::types::RuntimeMetrics>,
 }
 
 pub(crate) struct RateLimitState {

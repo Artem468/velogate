@@ -22,8 +22,11 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
+use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command as ProcessCommand;
 use tokio::task::JoinSet;
 use tonic::client::Grpc;
@@ -43,11 +46,11 @@ use functions::{
 };
 use rate_limit::{VelogateRateLimitLayer, endpoint_rate_limit_policy};
 use security::authorize_endpoint;
+pub use types::{CommandOptions, RateLimitOptions, Runtime, RuntimeError, RuntimeOptions};
 use types::{
-    DynamicGrpcCodec, EndpointRuntime, GrpcRequest, RuntimeResult, SQLX_DRIVERS, StepRuntimeDeps,
-    Value, Vars,
+    DynamicGrpcCodec, EndpointRuntime, GrpcRequest, RuntimeMetrics, RuntimeResult, SQLX_DRIVERS,
+    StepRuntimeDeps, Value, Vars,
 };
-pub use types::{Runtime, RuntimeError};
 
 struct EvaluatedResponse {
     body: Option<Value>,
@@ -57,6 +60,16 @@ struct EvaluatedResponse {
 
 impl Runtime {
     pub fn new(ast: FileAST, interner: Rodeo, plan: ExecutionPlan) -> Self {
+        Self::with_options(ast, interner, plan, RuntimeOptions::default())
+    }
+
+    pub fn with_options(
+        ast: FileAST,
+        interner: Rodeo,
+        plan: ExecutionPlan,
+        options: RuntimeOptions,
+    ) -> Self {
+        let command_slots = options.command.max_concurrency.max(1);
         Self {
             db_urls: Arc::new(db_urls(&ast, &interner)),
             proto_paths: Arc::new(proto_paths(&ast, &interner)),
@@ -66,6 +79,9 @@ impl Runtime {
             client: Client::new(),
             db_pools: Arc::new(DashMap::new()),
             proto_pools: Arc::new(DashMap::new()),
+            options: Arc::new(options),
+            command_slots: Arc::new(tokio::sync::Semaphore::new(command_slots)),
+            metrics: Arc::new(RuntimeMetrics::default()),
         }
     }
 
@@ -109,8 +125,16 @@ impl Runtime {
     pub fn router(&self) -> RuntimeResult<Router> {
         let mut router = Router::new();
         let static_vars = gateway_vars(&self.ast, &self.interner)?;
+        let mut registered_routes = std::collections::HashSet::new();
 
         for (idx, endpoint) in self.ast.endpoints.iter().enumerate() {
+            validate_runtime_route(&endpoint.path)?;
+            if !registered_routes.insert((endpoint.method.clone(), route_pattern(&endpoint.path))) {
+                return Err(RuntimeError::RouteConflict(format!(
+                    "conflicting route `{} {}`",
+                    endpoint.method, endpoint.path
+                )));
+            }
             let plan = self
                 .plan
                 .endpoints
@@ -127,6 +151,9 @@ impl Runtime {
                 db_pools: Arc::clone(&self.db_pools),
                 proto_paths: Arc::clone(&self.proto_paths),
                 proto_pools: Arc::clone(&self.proto_pools),
+                options: Arc::clone(&self.options),
+                command_slots: Arc::clone(&self.command_slots),
+                metrics: Arc::clone(&self.metrics),
             });
             let method =
                 method_filter(&endpoint.method).ok_or_else(|| RuntimeError::InvalidMethod {
@@ -154,15 +181,107 @@ impl Runtime {
                 },
             );
 
-            if let Some(policy) = endpoint_rate_limit_policy(endpoint) {
+            if let Some(policy) = endpoint_rate_limit_policy(
+                endpoint,
+                &self.options.rate_limit,
+                Arc::clone(&self.metrics),
+            ) {
                 method_router = method_router.layer(VelogateRateLimitLayer::new(policy));
             }
 
             router = router.route(&axum_route_path(&endpoint.path), method_router);
         }
 
+        router = self.add_operational_routes(router, &mut registered_routes)?;
         Ok(router)
     }
+
+    fn add_operational_routes(
+        &self,
+        mut router: Router,
+        registered: &mut std::collections::HashSet<(String, String)>,
+    ) -> RuntimeResult<Router> {
+        for (path, kind) in [
+            (self.options.health_path.as_deref(), "health"),
+            (self.options.readiness_path.as_deref(), "readiness"),
+            (self.options.metrics_path.as_deref(), "metrics"),
+        ] {
+            let Some(path) = path else { continue };
+            if !path.starts_with('/')
+                || path.contains(':')
+                || path.contains('{')
+                || path.contains('}')
+                || path.contains('*')
+            {
+                return Err(RuntimeError::Config(format!(
+                    "{kind} path must be a static absolute path, got `{path}`"
+                )));
+            }
+            if !registered.insert(("GET".to_string(), route_pattern(path))) {
+                return Err(RuntimeError::RouteConflict(format!(
+                    "{kind} path `{path}` conflicts with an endpoint"
+                )));
+            }
+
+            let metrics = Arc::clone(&self.metrics);
+            router = if kind == "metrics" {
+                router.route(
+                    path,
+                    axum::routing::get(move || async move {
+                        Json(json!({
+                            "requests": metrics.requests.load(AtomicOrdering::Relaxed),
+                            "failures": metrics.failures.load(AtomicOrdering::Relaxed),
+                            "rate_limited": metrics.rate_limited.load(AtomicOrdering::Relaxed),
+                            "commands_started": metrics.commands_started.load(AtomicOrdering::Relaxed),
+                            "commands_rejected": metrics.commands_rejected.load(AtomicOrdering::Relaxed),
+                        }))
+                    }),
+                )
+            } else {
+                router.route(
+                    path,
+                    axum::routing::get(|| async { Json(json!({ "status": "ok" })) }),
+                )
+            };
+        }
+        Ok(router)
+    }
+}
+
+fn route_pattern(path: &str) -> String {
+    path.split('/')
+        .map(|segment| {
+            if segment.starts_with(':') || (segment.starts_with('{') && segment.ends_with('}')) {
+                "{}"
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn validate_runtime_route(path: &str) -> RuntimeResult<()> {
+    if !path.starts_with('/') || path.contains(['{', '}', '*']) {
+        return Err(RuntimeError::Config(format!(
+            "invalid endpoint route `{path}`"
+        )));
+    }
+    for parameter in path
+        .split('/')
+        .filter_map(|segment| segment.strip_prefix(':'))
+    {
+        if parameter.is_empty()
+            || !parameter
+                .chars()
+                .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        {
+            return Err(RuntimeError::Config(format!(
+                "invalid endpoint route parameter `:{parameter}` in `{path}`"
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl EndpointRuntime {
@@ -174,7 +293,8 @@ impl EndpointRuntime {
         body: Value,
     ) -> Response {
         let endpoint = format!("{} {}", self.endpoint.method, self.endpoint.path);
-        debug!(%endpoint, "handling request");
+        let request_id = self.metrics.requests.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        debug!(%endpoint, request_id, "handling request");
         let mut vars = self.static_vars.clone();
         vars.reserve(path_params.len() + 4);
         insert_request_vars(
@@ -190,7 +310,7 @@ impl EndpointRuntime {
             warn!(%endpoint, message = %err.message, "request rejected by security rule");
             let body = json!({
                 "error": "unauthorized",
-                "message": err.message,
+                "message": "authorization failed",
             });
             return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
         }
@@ -220,11 +340,13 @@ impl EndpointRuntime {
                 response
             }
             Err(err) => {
+                self.metrics.failures.fetch_add(1, AtomicOrdering::Relaxed);
                 let status = error_status(&err);
-                error!(%endpoint, %status, error = %err, "request failed");
+                error!(%endpoint, %status, request_id, error = %err, "request failed");
                 let body = json!({
                     "error": error_code(&err),
-                    "message": err.to_string(),
+                    "message": public_error_message(&err),
+                    "request_id": format!("{request_id:016x}"),
                 });
                 (status, Json(body)).into_response()
             }
@@ -243,6 +365,9 @@ impl EndpointRuntime {
                     db_pools: &self.db_pools,
                     proto_paths: &self.proto_paths,
                     proto_pools: &self.proto_pools,
+                    options: &self.options,
+                    command_slots: &self.command_slots,
+                    metrics: &self.metrics,
                 };
                 debug!(
                     step = step_idx,
@@ -270,6 +395,9 @@ impl EndpointRuntime {
                 let db_pools = Arc::clone(&self.db_pools);
                 let proto_paths = Arc::clone(&self.proto_paths);
                 let proto_pools = Arc::clone(&self.proto_pools);
+                let options = Arc::clone(&self.options);
+                let command_slots = Arc::clone(&self.command_slots);
+                let metrics = Arc::clone(&self.metrics);
 
                 tasks.spawn(async move {
                     let var = step.var_name();
@@ -279,6 +407,9 @@ impl EndpointRuntime {
                         db_pools: &db_pools,
                         proto_paths: &proto_paths,
                         proto_pools: &proto_pools,
+                        options: &options,
+                        command_slots: &command_slots,
+                        metrics: &metrics,
                     };
                     debug!(
                         step = step_idx_value,
@@ -309,7 +440,7 @@ async fn execute_step(
 ) -> RuntimeResult<Value> {
     match step {
         Step::Let { value, .. } => eval_expr(value, vars, interner),
-        Step::Command { command, .. } => execute_command(command).await,
+        Step::Command { command, .. } => execute_command(command, deps).await,
         Step::FetchHttp { config, .. } => fetch_http(config, vars, interner, deps.client).await,
         Step::Pipe {
             source, operations, ..
@@ -323,16 +454,76 @@ async fn execute_step(
     }
 }
 
-async fn execute_command(command: &str) -> RuntimeResult<Value> {
-    let output = shell_command(command).output().await.map_err(|err| {
+async fn execute_command(command: &str, deps: &StepRuntimeDeps<'_>) -> RuntimeResult<Value> {
+    if !deps.options.command.enabled {
+        deps.metrics
+            .commands_rejected
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        return Err(RuntimeError::Execution(
+            "command execution is disabled; enable it explicitly at startup".to_string(),
+        ));
+    }
+
+    let permit = deps.command_slots.acquire().await.map_err(|_| {
+        RuntimeError::Execution("command concurrency limiter is closed".to_string())
+    })?;
+    deps.metrics
+        .commands_started
+        .fetch_add(1, AtomicOrdering::Relaxed);
+
+    let mut process = shell_command(command);
+    process
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = process.spawn().map_err(|err| {
         RuntimeError::Execution(format!("command `{command}` failed to start: {err}"))
     })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| RuntimeError::Execution("failed to capture command stdout".to_string()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| RuntimeError::Execution("failed to capture command stderr".to_string()))?;
+    let max_output = deps.options.command.max_output_bytes;
+
+    let work = async move {
+        let stdout_task = read_limited(stdout, max_output);
+        let stderr_task = read_limited(stderr, max_output);
+        let (status, stdout, stderr) = tokio::try_join!(child.wait(), stdout_task, stderr_task)
+            .map_err(|err| RuntimeError::Execution(format!("command execution failed: {err}")))?;
+        RuntimeResult::Ok((status, stdout, stderr))
+    };
+    let (status, stdout, stderr) = tokio::time::timeout(deps.options.command.timeout, work)
+        .await
+        .map_err(|_| RuntimeError::Timeout("command execution timed out".to_string()))??;
+    drop(permit);
+
     Ok(json!({
-        "success": output.status.success(),
-        "status": output.status.code(),
-        "stdout": String::from_utf8_lossy(&output.stdout).trim_end().to_string(),
-        "stderr": String::from_utf8_lossy(&output.stderr).trim_end().to_string(),
+        "success": status.success(),
+        "status": status.code(),
+        "stdout": String::from_utf8_lossy(&stdout).trim_end().to_string(),
+        "stderr": String::from_utf8_lossy(&stderr).trim_end().to_string(),
     }))
+}
+
+async fn read_limited<R>(reader: R, max_bytes: usize) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+    reader
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() > max_bytes {
+        return Err(std::io::Error::other(format!(
+            "command output exceeded {max_bytes} bytes"
+        )));
+    }
+    Ok(bytes)
 }
 
 #[cfg(target_os = "windows")]
@@ -1258,7 +1449,8 @@ fn error_status(error: &RuntimeError) -> StatusCode {
         | RuntimeError::Serve(_)
         | RuntimeError::Config(_)
         | RuntimeError::Database(_)
-        | RuntimeError::Execution(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        | RuntimeError::Execution(_)
+        | RuntimeError::RouteConflict(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -1274,7 +1466,25 @@ fn error_code(error: &RuntimeError) -> &'static str {
         | RuntimeError::InvalidBindAddress(_)
         | RuntimeError::Bind(_)
         | RuntimeError::Serve(_)
-        | RuntimeError::Execution(_) => "runtime_error",
+        | RuntimeError::Execution(_)
+        | RuntimeError::RouteConflict(_) => "runtime_error",
+    }
+}
+
+fn public_error_message(error: &RuntimeError) -> &'static str {
+    match error {
+        RuntimeError::BadRequest(_) => "request could not be processed",
+        RuntimeError::Upstream(_) => "upstream service failed",
+        RuntimeError::Timeout(_) => "operation timed out",
+        RuntimeError::Database(_) => "database operation failed",
+        RuntimeError::Grpc(_) => "grpc service failed",
+        RuntimeError::InvalidMethod { .. }
+        | RuntimeError::InvalidBindAddress(_)
+        | RuntimeError::Bind(_)
+        | RuntimeError::Serve(_)
+        | RuntimeError::Config(_)
+        | RuntimeError::Execution(_)
+        | RuntimeError::RouteConflict(_) => "internal server error",
     }
 }
 

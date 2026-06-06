@@ -2,7 +2,7 @@ use crate::ast::FileAST;
 use crate::export::export_file;
 use crate::parser::Parser;
 use crate::planner::{ExecutionPlan, build_plan};
-use crate::runtime::Runtime;
+use crate::runtime::{Runtime, RuntimeOptions};
 use crate::validator::validate_file;
 use axum::body::Body;
 use axum::extract::State;
@@ -27,6 +27,7 @@ pub struct DevConfig {
     pub config_path: PathBuf,
     pub env_file: Option<PathBuf>,
     pub ui_port: Option<u16>,
+    pub runtime_options: RuntimeOptions,
 }
 
 #[derive(RustEmbed)]
@@ -39,6 +40,7 @@ pub async fn run_dev_server(config: DevConfig) -> Result<(), String> {
     let runner = Arc::new(Mutex::new(ProjectRunner::new(
         config.config_path,
         config.env_file,
+        config.runtime_options,
     )));
     runner.lock().await.start().await?;
 
@@ -216,6 +218,7 @@ fn json_error(status: StatusCode, message: String) -> Response {
 struct ProjectRunner {
     config_path: PathBuf,
     env_file: Option<PathBuf>,
+    runtime_options: RuntimeOptions,
     running: Option<RunningRuntime>,
     last_error: Arc<Mutex<Option<String>>>,
 }
@@ -227,10 +230,15 @@ struct RunningRuntime {
 }
 
 impl ProjectRunner {
-    fn new(config_path: PathBuf, env_file: Option<PathBuf>) -> Self {
+    fn new(
+        config_path: PathBuf,
+        env_file: Option<PathBuf>,
+        runtime_options: RuntimeOptions,
+    ) -> Self {
         Self {
             config_path,
             env_file,
+            runtime_options,
             running: None,
             last_error: Arc::new(Mutex::new(None)),
         }
@@ -246,7 +254,12 @@ impl ProjectRunner {
         }
 
         let parsed = parse_config(&self.config_path, self.env_file.as_deref())?;
-        let runtime = Runtime::new(parsed.ast, parsed.interner, parsed.plan);
+        let runtime = Runtime::with_options(
+            parsed.ast,
+            parsed.interner,
+            parsed.plan,
+            self.runtime_options.clone(),
+        );
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let last_error = Arc::clone(&self.last_error);
 

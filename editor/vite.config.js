@@ -21,6 +21,15 @@ export default defineConfig({
   },
   build: {
     outDir: 'dist',
-    emptyOutDir: true
+    emptyOutDir: true,
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('elkjs')) return 'elk';
+          if (id.includes('@xyflow')) return 'xyflow';
+          if (id.includes('node_modules')) return 'vendor';
+        }
+      }
+    }
   }
 });

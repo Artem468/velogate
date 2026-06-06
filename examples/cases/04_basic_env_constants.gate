@@ -1,6 +1,6 @@
 gateway "basic-env-constants" {
     port: 8094,
-    env_file: "secure.env",
+    env_file: "secure.example.env",
     constants: {
         "service_name": "admin-api",
         "allowed_user": "admin"
