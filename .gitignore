@@ -1,6 +1,7 @@
 /target
 .idea/
 editor/node_modules/
+editor/dist/
 .env
 .env.*
 !.env.example
