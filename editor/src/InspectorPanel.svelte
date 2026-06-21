@@ -35,6 +35,8 @@
       <label>Port<input type="number" value={selected.data.config.port} on:input={(event) => updateConfig('port', Number(event.currentTarget.value))} /></label>
       <label>Host<input value={selected.data.config.host} on:input={(event) => updateConfig('host', event.currentTarget.value)} /></label>
       <label>Env file<input value={selected.data.config.envFile} on:input={(event) => updateConfig('envFile', event.currentTarget.value)} /></label>
+      <div class="section-title">CORS</div>
+      <label>CORS code<textarea class="codebox compact" placeholder={'origins: ["https://app.example"],\nmethods: ["GET", "POST"]'} value={selected.data.config.corsCode} on:input={(event) => updateConfig('corsCode', event.currentTarget.value)}></textarea></label>
       <div class="section-title">Constants</div>
       <label>Constants code<textarea class="codebox compact" placeholder='"api": env.API_URL' value={selected.data.config.constantsCode} on:input={(event) => updateConfig('constantsCode', event.currentTarget.value)}></textarea></label>
       <div class="section-title">Databases</div>

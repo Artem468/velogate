@@ -46,6 +46,7 @@ export function linesFromConfig(config) {
             `Host: ${config.host || 'default'}`,
             `Env: ${config.envFile || 'none'}`
         ];
+        if (trimValue(config.corsCode)) lines.push('CORS configured');
         if (trimValue(config.constantsCode)) lines.push('Constants configured');
         if (trimValue(config.databasesCode)) lines.push('Databases configured');
         if (trimValue(config.protosCode)) lines.push('Protos configured');
@@ -105,6 +106,7 @@ export function gatewayConfig(gateway) {
         port: gateway.port ?? 0,
         host: gateway.host ?? '',
         envFile: gateway.env_file ?? '',
+        corsCode: formatCorsCode(gateway.cors),
         constantsCode: Object.entries(gateway.constants ?? {})
             .map(([key, value]) => `${JSON.stringify(key)}: ${formatExpr(value)}`)
             .join(',\n'),
@@ -116,6 +118,18 @@ export function gatewayConfig(gateway) {
             .join('\n'),
         lines: []
     };
+}
+
+function formatCorsCode(cors) {
+    if (!cors) return '';
+    const lines = [];
+    if (cors.origins?.length) lines.push(`origins: ${JSON.stringify(cors.origins)}`);
+    if (cors.methods?.length) lines.push(`methods: ${JSON.stringify(cors.methods)}`);
+    if (cors.headers?.length) lines.push(`headers: ${JSON.stringify(cors.headers)}`);
+    if (cors.expose_headers?.length) lines.push(`expose_headers: ${JSON.stringify(cors.expose_headers)}`);
+    if (cors.credentials) lines.push(`credentials: true`);
+    if (cors.max_age_seconds != null) lines.push(`max_age: ${Number(cors.max_age_seconds)}`);
+    return lines.join(',\n');
 }
 
 export function endpointConfig(endpoint, index) {
@@ -165,6 +179,7 @@ export function buildGatewayBody(nodes, notify, silent = false) {
     const lines = [`port: ${port},`];
     if (trimValue(config.host)) lines.push(`host: ${JSON.stringify(trimValue(config.host))},`);
     if (trimValue(config.envFile)) lines.push(`env_file: ${JSON.stringify(trimValue(config.envFile))},`);
+    if (trimValue(config.corsCode)) lines.push(`cors: {\n${indentBlock(config.corsCode, 8)}\n    },`);
     if (trimValue(config.constantsCode)) lines.push(`constants: {\n${indentBlock(config.constantsCode, 8)}\n    },`);
     if (trimValue(config.databasesCode)) lines.push(`databases: [\n${indentBlock(config.databasesCode, 8)}\n    ],`);
     if (trimValue(config.protosCode)) lines.push(`protos: [\n${indentBlock(config.protosCode, 8)}\n    ],`);

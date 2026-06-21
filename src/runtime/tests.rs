@@ -908,6 +908,57 @@ async fn operational_endpoints_are_configurable() {
     assert_eq!(metrics.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn gateway_cors_config_handles_preflight() {
+    let source = r#"
+        gateway "test" {
+            port: 0,
+            cors: {
+                origins: ["https://app.example"],
+                methods: ["GET"],
+                headers: ["authorization"],
+                expose_headers: ["x-request-id"],
+                credentials: true,
+                max_age: 3600
+            }
+        }
+
+        endpoint "GET /items" {
+            respond 200 { "ok": true }
+        }
+    "#;
+
+    let response = test_router(source)
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/items")
+                .header("origin", "https://app.example")
+                .header("access-control-request-method", "GET")
+                .header("access-control-request-headers", "authorization")
+                .body(axum::body::Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("route should respond");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some("https://app.example")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-credentials")
+            .and_then(|value| value.to_str().ok()),
+        Some("true")
+    );
+}
+
 #[test]
 fn router_rejects_equivalent_dynamic_routes_without_panicking() {
     let source = r#"

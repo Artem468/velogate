@@ -6,7 +6,7 @@ use crate::planner::ExecutionPlan;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query};
 use axum::http::header::{HeaderName, HeaderValue, SET_COOKIE};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::on;
 use axum::{Json, Router};
@@ -14,7 +14,7 @@ use dashmap::DashMap;
 use lasso::Rodeo;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
 use prost_types::{ListValue, Struct, Value as ProstValue, value::Kind};
-use reqwest::{Client, Method};
+use reqwest::{Client, Method as ReqwestMethod};
 use serde_json::{Map, json};
 use sqlx::any::{AnyPoolOptions, install_default_drivers};
 use sqlx::{AnyPool, Column, Row, TypeInfo};
@@ -32,6 +32,7 @@ use tokio::task::JoinSet;
 use tonic::client::Grpc;
 use tonic::transport::{Channel, Endpoint as TonicEndpoint};
 use tonic_prost::ProstCodec;
+use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer, ExposeHeaders};
 use tracing::{debug, error, info, warn};
 
 mod functions;
@@ -193,7 +194,29 @@ impl Runtime {
         }
 
         router = self.add_operational_routes(router, &mut registered_routes)?;
+        if let Some(cors_layer) = self.cors_layer()? {
+            router = router.layer(cors_layer);
+        }
         Ok(router)
+    }
+
+    fn cors_layer(&self) -> RuntimeResult<Option<CorsLayer>> {
+        let Some(cors) = self.ast.gateway.cors.as_ref() else {
+            return Ok(None);
+        };
+
+        let mut layer = CorsLayer::new()
+            .allow_origin(cors_allow_origin(&cors.origins)?)
+            .allow_methods(cors_allow_methods(&cors.methods)?)
+            .allow_headers(cors_allow_headers(&cors.headers)?)
+            .expose_headers(cors_expose_headers(&cors.expose_headers)?)
+            .allow_credentials(cors.credentials);
+
+        if let Some(max_age) = cors.max_age_seconds {
+            layer = layer.max_age(Duration::from_secs(max_age));
+        }
+
+        Ok(Some(layer))
     }
 
     fn add_operational_routes(
@@ -259,6 +282,70 @@ fn route_pattern(path: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+fn cors_allow_origin(origins: &[String]) -> RuntimeResult<AllowOrigin> {
+    if origins.iter().any(|origin| origin == "*") {
+        return Ok(AllowOrigin::any());
+    }
+    let origins = origins
+        .iter()
+        .map(|origin| {
+            HeaderValue::from_str(origin).map_err(|err| {
+                RuntimeError::Config(format!("invalid gateway.cors origin `{origin}`: {err}"))
+            })
+        })
+        .collect::<RuntimeResult<Vec<_>>>()?;
+    Ok(AllowOrigin::list(origins))
+}
+
+fn cors_allow_methods(methods: &[String]) -> RuntimeResult<AllowMethods> {
+    if methods.is_empty() || methods.iter().any(|method| method == "*") {
+        return Ok(AllowMethods::any());
+    }
+    let methods = methods
+        .iter()
+        .map(|method| {
+            Method::from_bytes(method.as_bytes()).map_err(|err| {
+                RuntimeError::Config(format!("invalid gateway.cors method `{method}`: {err}"))
+            })
+        })
+        .collect::<RuntimeResult<Vec<_>>>()?;
+    Ok(AllowMethods::list(methods))
+}
+
+fn cors_allow_headers(headers: &[String]) -> RuntimeResult<AllowHeaders> {
+    if headers.is_empty() || headers.iter().any(|header| header == "*") {
+        return Ok(AllowHeaders::any());
+    }
+    Ok(AllowHeaders::list(cors_header_names(
+        "gateway.cors.headers",
+        headers,
+    )?))
+}
+
+fn cors_expose_headers(headers: &[String]) -> RuntimeResult<ExposeHeaders> {
+    if headers.is_empty() {
+        return Ok(ExposeHeaders::default());
+    }
+    if headers.iter().any(|header| header == "*") {
+        return Ok(ExposeHeaders::any());
+    }
+    Ok(ExposeHeaders::list(cors_header_names(
+        "gateway.cors.expose_headers",
+        headers,
+    )?))
+}
+
+fn cors_header_names(field: &str, headers: &[String]) -> RuntimeResult<Vec<HeaderName>> {
+    headers
+        .iter()
+        .map(|header| {
+            HeaderName::from_bytes(header.as_bytes()).map_err(|err| {
+                RuntimeError::Config(format!("{field} contains invalid header `{header}`: {err}"))
+            })
+        })
+        .collect()
 }
 
 fn validate_runtime_route(path: &str) -> RuntimeResult<()> {
@@ -548,7 +635,7 @@ async fn fetch_http(
 ) -> RuntimeResult<Value> {
     let url = as_string(eval_expr(&config.url, vars, interner)?);
     let method_name = config.method.as_deref().unwrap_or("GET").to_uppercase();
-    let method = Method::from_bytes(method_name.as_bytes()).map_err(|err| {
+    let method = ReqwestMethod::from_bytes(method_name.as_bytes()).map_err(|err| {
         RuntimeError::BadRequest(format!(
             "invalid HTTP method `{method_name}` for fetch: {err}"
         ))

@@ -1,0 +1,23 @@
+digraph velogate_plan {
+  rankdir=LR;
+  endpoint_0 [label="GET /v1/items/:id", shape=oval];
+  subgraph cluster_0_0 {
+    label="layer 0";
+    "endpoint_0_step_0" [label="0: seed", shape=box];
+    "endpoint_0_step_1" [label="1: rows", shape=box];
+  }
+  subgraph cluster_0_1 {
+    label="layer 1";
+    "endpoint_0_step_2" [label="2: selected", shape=box];
+  }
+  endpoint_0 -> "endpoint_0_step_0";
+  endpoint_0 -> "endpoint_0_step_1";
+  endpoint_0 -> "endpoint_0_step_2";
+  "endpoint_0_step_1" -> "endpoint_0_step_2";
+  endpoint_1 [label="POST /v1/items", shape=oval];
+  subgraph cluster_1_0 {
+    label="layer 0";
+    "endpoint_1_step_0" [label="0: created", shape=box];
+  }
+  endpoint_1 -> "endpoint_1_step_0";
+}

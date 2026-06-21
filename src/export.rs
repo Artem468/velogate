@@ -16,9 +16,20 @@ pub struct GatewayExport {
     pub port: u16,
     pub host: Option<String>,
     pub env_file: Option<String>,
+    pub cors: Option<CorsExport>,
     pub constants: BTreeMap<String, ExprExport>,
     pub static_dbs: Vec<StaticDbExport>,
     pub static_protos: Vec<StaticProtoExport>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CorsExport {
+    pub origins: Vec<String>,
+    pub methods: Vec<String>,
+    pub headers: Vec<String>,
+    pub expose_headers: Vec<String>,
+    pub credentials: bool,
+    pub max_age_seconds: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -199,6 +210,14 @@ pub fn export_file(ast: &FileAST, interner: &Rodeo) -> FileExport {
             port: ast.gateway.port,
             host: ast.gateway.host.clone(),
             env_file: ast.gateway.env_file.clone(),
+            cors: ast.gateway.cors.as_ref().map(|cors| CorsExport {
+                origins: cors.origins.clone(),
+                methods: cors.methods.clone(),
+                headers: cors.headers.clone(),
+                expose_headers: cors.expose_headers.clone(),
+                credentials: cors.credentials,
+                max_age_seconds: cors.max_age_seconds,
+            }),
             constants: ast
                 .gateway
                 .constants

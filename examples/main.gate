@@ -2,6 +2,14 @@ gateway "VeloGate-BFF" {
     port: 8080,
     host: "0.0.0.0",
     env_file: "example.env",
+    cors: {
+        origins: ["http://localhost:5173", "http://localhost:8080"],
+        methods: ["GET", "POST", "PATCH"],
+        headers: ["authorization", "content-type"],
+        expose_headers: ["x-request-id"],
+        credentials: true,
+        max_age: 3600
+    },
     constants: {
         "todos_api": env.TODOS_API,
         "default_take": 100,

@@ -1,0 +1,56 @@
+gateway "fixture-api" {
+    port: 8080,
+    host: "127.0.0.1",
+    cors: {
+        origins: ["https://app.example"],
+        methods: ["GET", "POST"],
+        headers: ["authorization", "content-type"],
+        expose_headers: ["x-request-id"],
+        credentials: true,
+        max_age: 3600
+    },
+    constants: {
+        "api_base": "https://upstream.example",
+        "default_limit": 2
+    }
+}
+
+endpoint "GET /v1/items/:id" {
+    rate_limit: 10/rps window 1000ms,
+
+    let seed = { "id": id, "score": 10 };
+    let rows = [
+        { "id": "a", "score": 3 },
+        { "id": "b", "score": 8 },
+        { "id": "c", "score": 5 }
+    ];
+    let selected = rows
+    | filter(row => row.score >= 5)
+    | map(row => {
+        "id": row.id,
+        "score": row.score
+    })
+    | take(default_limit);
+
+    respond 200
+    headers { "x-request-id": id }
+    body {
+        "seed": seed,
+        "items": selected
+    }
+}
+
+endpoint "POST /v1/items" {
+    fetch api_base + "/items" as created {
+        method: "POST",
+        body: body,
+        timeout: 500ms,
+        retry: 1 times,
+        delay: 25ms,
+        fallback: { "ok": false }
+    };
+
+    respond 201 {
+        "created": created
+    }
+}

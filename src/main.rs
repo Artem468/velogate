@@ -305,6 +305,14 @@ fn doctor(args: CheckArgs) -> Result<(), ()> {
         "env_file: {}",
         ast.gateway.env_file.as_deref().unwrap_or("none")
     );
+    println!(
+        "cors: {}",
+        ast.gateway
+            .cors
+            .as_ref()
+            .map(|cors| format!("{} origin(s)", cors.origins.len()))
+            .unwrap_or_else(|| "none".to_string())
+    );
     println!("constants: {}", ast.gateway.constants.len());
     println!("databases: {}", ast.gateway.static_dbs.len());
     println!("protos: {}", ast.gateway.static_protos.len());

@@ -1,0 +1,90 @@
+{
+  "components": {
+    "securitySchemes": {}
+  },
+  "info": {
+    "title": "fixture-api",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/v1/items": {
+      "post": {
+        "operationId": "post_v1_items",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "properties": {
+                    "created": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful response"
+          }
+        },
+        "summary": "POST /v1/items"
+      }
+    },
+    "/v1/items/{id}": {
+      "get": {
+        "operationId": "get_v1_items_id",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "properties": {
+                    "items": {},
+                    "seed": {}
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful response"
+          }
+        },
+        "summary": "GET /v1/items/:id",
+        "x-rate-limit": {
+          "key": "ip",
+          "limit": 10,
+          "unit": "rps",
+          "window_ms": 1000
+        }
+      }
+    }
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8080"
+    }
+  ]
+}

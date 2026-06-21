@@ -14,6 +14,7 @@ GatewayConfig: GatewayConfig = {
         let mut port_raw = None;
         let mut host = None;
         let mut env_file = None;
+        let mut cors = None;
         let mut constants = Vec::new();
         let mut static_dbs = Vec::new();
         let mut static_protos = Vec::new();
@@ -22,6 +23,7 @@ GatewayConfig: GatewayConfig = {
                 GatewayItem::Port(value) => port_raw = Some(value),
                 GatewayItem::Host(value) => host = Some(value),
                 GatewayItem::EnvFile(value) => env_file = Some(value),
+                GatewayItem::Cors(value) => cors = Some(value),
                 GatewayItem::Constants(value) => constants = value,
                 GatewayItem::Databases(value) => static_dbs = value,
                 GatewayItem::Protos(value) => static_protos = value,
@@ -30,7 +32,7 @@ GatewayConfig: GatewayConfig = {
         let port = port_raw
             .and_then(|value| u16::try_from(value).ok())
             .unwrap_or_default();
-        GatewayConfig { name, port, port_raw, host, env_file, constants, static_dbs, static_protos }
+        GatewayConfig { name, port, port_raw, host, env_file, cors, constants, static_dbs, static_protos }
     }
 };
 
@@ -38,9 +40,51 @@ GatewayItem: GatewayItem = {
     "port" ":" <port:Int> ","? => GatewayItem::Port(port),
     "host" ":" <host:String> ","? => GatewayItem::Host(host),
     "env_file" ":" <path:String> ","? => GatewayItem::EnvFile(path),
+    "cors" ":" "{" <entries:CorsConfigEntryList> "}" ","? => {
+        let mut cfg = CorsConfig::default();
+        for entry in entries {
+            match entry {
+                CorsConfigEntry::Origins(value) => cfg.origins = value,
+                CorsConfigEntry::Methods(value) => cfg.methods = value,
+                CorsConfigEntry::Headers(value) => cfg.headers = value,
+                CorsConfigEntry::ExposeHeaders(value) => cfg.expose_headers = value,
+                CorsConfigEntry::Credentials(value) => cfg.credentials = value,
+                CorsConfigEntry::MaxAge(value) => cfg.max_age_seconds = u64::try_from(value).ok(),
+            }
+        }
+        GatewayItem::Cors(cfg)
+    },
     "constants" ":" "{" <constants:GatewayConstantList> "}" ","? => GatewayItem::Constants(constants),
     "databases" ":" "[" <dbs:StaticDbList> "]" ","? => GatewayItem::Databases(dbs),
     "protos" ":" "[" <protos:StaticProtoList> "]" ","? => GatewayItem::Protos(protos),
+};
+
+CorsConfigEntryList: Vec<CorsConfigEntry> = {
+    <mut v:(<CorsConfigEntry> ",")*> <e:CorsConfigEntry?> => {
+        if let Some(last) = e { v.push(last); }
+        v
+    }
+};
+
+CorsConfigEntry: CorsConfigEntry = {
+    "origins" ":" "[" <value:StringList> "]" => CorsConfigEntry::Origins(value),
+    "methods" ":" "[" <value:StringList> "]" => CorsConfigEntry::Methods(value),
+    "headers" ":" "[" <value:StringList> "]" => CorsConfigEntry::Headers(value),
+    "expose_headers" ":" "[" <value:StringList> "]" => CorsConfigEntry::ExposeHeaders(value),
+    "credentials" ":" <value:Boolean> => CorsConfigEntry::Credentials(value),
+    "max_age" ":" <value:Int> => CorsConfigEntry::MaxAge(value),
+};
+
+StringList: Vec<String> = {
+    <mut v:(<String> ",")*> <e:String?> => {
+        if let Some(last) = e { v.push(last); }
+        v
+    }
+};
+
+Boolean: bool = {
+    "true" => true,
+    "false" => false,
 };
 
 GatewayConstantList: Vec<GatewayConstant> = {
@@ -250,6 +294,11 @@ IdentLike: String = {
     "checks" => "checks".to_string(),
     "env_file" => "env_file".to_string(),
     "constants" => "constants".to_string(),
+    "cors" => "cors".to_string(),
+    "origins" => "origins".to_string(),
+    "credentials" => "credentials".to_string(),
+    "max_age" => "max_age".to_string(),
+    "expose_headers" => "expose_headers".to_string(),
     "command" => "command".to_string(),
     "sync" => "sync".to_string(),
 };
@@ -285,6 +334,7 @@ FieldLike: String = {
     "headers" => "headers".to_string(),
     "cookies" => "cookies".to_string(),
     "window" => "window".to_string(),
+    "methods" => "methods".to_string(),
 };
 
 Step: Step = {
@@ -577,6 +627,12 @@ extern {
         "host" => Token::Host,
         "env_file" => Token::EnvFile,
         "constants" => Token::Constants,
+        "cors" => Token::Cors,
+        "origins" => Token::Origins,
+        "methods" => Token::Methods,
+        "credentials" => Token::Credentials,
+        "max_age" => Token::MaxAge,
+        "expose_headers" => Token::ExposeHeaders,
         "url" => Token::Url,
         "path" => Token::Path,
         "secure" => Token::Secure,

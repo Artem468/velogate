@@ -11,9 +11,20 @@ pub struct GatewayConfig {
     pub port_raw: Option<i64>,
     pub host: Option<String>,
     pub env_file: Option<String>,
+    pub cors: Option<CorsConfig>,
     pub constants: Vec<GatewayConstant>,
     pub static_dbs: Vec<StaticDb>,
     pub static_protos: Vec<StaticProto>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CorsConfig {
+    pub origins: Vec<String>,
+    pub methods: Vec<String>,
+    pub headers: Vec<String>,
+    pub expose_headers: Vec<String>,
+    pub credentials: bool,
+    pub max_age_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,9 +115,20 @@ pub(crate) enum GatewayItem {
     Port(i64),
     Host(String),
     EnvFile(String),
+    Cors(CorsConfig),
     Constants(Vec<GatewayConstant>),
     Databases(Vec<StaticDb>),
     Protos(Vec<StaticProto>),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum CorsConfigEntry {
+    Origins(Vec<String>),
+    Methods(Vec<String>),
+    Headers(Vec<String>),
+    ExposeHeaders(Vec<String>),
+    Credentials(bool),
+    MaxAge(i64),
 }
 
 #[derive(Debug, Clone)]

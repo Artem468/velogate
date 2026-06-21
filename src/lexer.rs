@@ -27,6 +27,18 @@ pub(crate) enum Token {
     EnvFile,
     #[token("constants")]
     Constants,
+    #[token("cors")]
+    Cors,
+    #[token("origins")]
+    Origins,
+    #[token("methods")]
+    Methods,
+    #[token("credentials")]
+    Credentials,
+    #[token("max_age")]
+    MaxAge,
+    #[token("expose_headers")]
+    ExposeHeaders,
     #[token("url")]
     Url,
     #[token("path")]

@@ -1,0 +1,12 @@
+.git
+.github
+.idea
+target
+editor/node_modules
+editor/dist
+Dockerfile
+docker-compose.yml
+.env
+.env.*
+!.env.example
+!*.example.env

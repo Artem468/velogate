@@ -1,4 +1,5 @@
 use crate::ast::{EndpointOption, FileAST};
+use http::{HeaderName, HeaderValue, Method};
 use lasso::Rodeo;
 use std::collections::HashSet;
 use std::path::Path;
@@ -36,6 +37,8 @@ fn validate_gateway(
         validate_existing_file(config_path, env_file, "gateway.env_file", errors);
     }
 
+    validate_cors(ast, errors);
+
     validate_unique_symbols(
         ast.gateway.constants.iter().map(|constant| constant.name),
         interner,
@@ -57,6 +60,55 @@ fn validate_gateway(
 
     for proto in &ast.gateway.static_protos {
         validate_existing_file(config_path, &proto.path, "proto.path", errors);
+    }
+}
+
+fn validate_cors(ast: &FileAST, errors: &mut Vec<ValidationError>) {
+    let Some(cors) = ast.gateway.cors.as_ref() else {
+        return;
+    };
+
+    if cors.origins.is_empty() {
+        push(
+            errors,
+            "gateway.cors.origins must contain at least one origin",
+        );
+    }
+
+    if cors.credentials && cors.origins.iter().any(|origin| origin == "*") {
+        push(
+            errors,
+            "gateway.cors.credentials cannot be true when origins contains `*`",
+        );
+    }
+
+    for origin in &cors.origins {
+        if origin != "*" && HeaderValue::from_str(origin).is_err() {
+            push(
+                errors,
+                format!("gateway.cors.origins contains invalid origin `{origin}`"),
+            );
+        }
+    }
+
+    for method in &cors.methods {
+        if method != "*" && Method::from_bytes(method.as_bytes()).is_err() {
+            push(
+                errors,
+                format!("gateway.cors.methods contains invalid method `{method}`"),
+            );
+        }
+    }
+
+    validate_header_names("gateway.cors.headers", &cors.headers, errors);
+    validate_header_names("gateway.cors.expose_headers", &cors.expose_headers, errors);
+}
+
+fn validate_header_names(field: &str, names: &[String], errors: &mut Vec<ValidationError>) {
+    for name in names {
+        if name != "*" && HeaderName::from_bytes(name.as_bytes()).is_err() {
+            push(errors, format!("{field} contains invalid header `{name}`"));
+        }
     }
 }
 
@@ -319,6 +371,24 @@ mod tests {
             &errors,
             "gateway.env_file points to missing file"
         ));
+    }
+
+    #[test]
+    fn rejects_invalid_cors_config() {
+        let source = r#"
+            gateway "api" {
+                port: 8080,
+                cors: {
+                    origins: ["*"],
+                    credentials: true,
+                    headers: ["bad header"]
+                }
+            }
+        "#;
+
+        let errors = validate(source);
+        assert!(has_error(&errors, "credentials cannot be true"));
+        assert!(has_error(&errors, "invalid header `bad header`"));
     }
 
     fn validate(source: &str) -> Vec<String> {

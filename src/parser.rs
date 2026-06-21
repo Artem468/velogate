@@ -281,6 +281,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_gateway_cors_config() {
+        let source = r#"
+            gateway "api" {
+                port: 8080,
+                cors: {
+                    origins: ["https://app.example"],
+                    methods: ["GET", "POST"],
+                    headers: ["authorization", "content-type"],
+                    expose_headers: ["x-request-id"],
+                    credentials: true,
+                    max_age: 3600
+                }
+            }
+        "#;
+
+        let mut parser = Parser::new(Rodeo::new());
+        let ast = parser.parse(source).expect("valid DSL should parse");
+        let cors = ast.gateway.cors.as_ref().expect("cors should parse");
+
+        assert_eq!(cors.origins, ["https://app.example"]);
+        assert_eq!(cors.methods, ["GET", "POST"]);
+        assert_eq!(cors.headers, ["authorization", "content-type"]);
+        assert_eq!(cors.expose_headers, ["x-request-id"]);
+        assert!(cors.credentials);
+        assert_eq!(cors.max_age_seconds, Some(3600));
+    }
+
+    #[test]
     fn rejects_unknown_gateway_string_key() {
         let source = r#"
             gateway "api" {

@@ -1,0 +1,253 @@
+{
+  "gateway": {
+    "name": "fixture-api",
+    "port": 8080,
+    "host": "127.0.0.1",
+    "env_file": null,
+    "cors": {
+      "origins": [
+        "https://app.example"
+      ],
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "headers": [
+        "authorization",
+        "content-type"
+      ],
+      "expose_headers": [
+        "x-request-id"
+      ],
+      "credentials": true,
+      "max_age_seconds": 3600
+    },
+    "constants": {
+      "api_base": {
+        "kind": "string",
+        "value": "https://upstream.example"
+      },
+      "default_limit": {
+        "kind": "number",
+        "value": 2.0
+      }
+    },
+    "static_dbs": [],
+    "static_protos": []
+  },
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/v1/items/:id",
+      "options": [
+        {
+          "kind": "rate_limit",
+          "limit": 10,
+          "unit": "rps",
+          "window_ms": 1000
+        }
+      ],
+      "steps": [
+        {
+          "kind": "let",
+          "var_name": "seed",
+          "value": {
+            "kind": "object",
+            "fields": {
+              "id": {
+                "kind": "variable",
+                "name": "id"
+              },
+              "score": {
+                "kind": "number",
+                "value": 10.0
+              }
+            }
+          }
+        },
+        {
+          "kind": "let",
+          "var_name": "rows",
+          "value": {
+            "kind": "array",
+            "items": [
+              {
+                "kind": "object",
+                "fields": {
+                  "id": {
+                    "kind": "string",
+                    "value": "a"
+                  },
+                  "score": {
+                    "kind": "number",
+                    "value": 3.0
+                  }
+                }
+              },
+              {
+                "kind": "object",
+                "fields": {
+                  "id": {
+                    "kind": "string",
+                    "value": "b"
+                  },
+                  "score": {
+                    "kind": "number",
+                    "value": 8.0
+                  }
+                }
+              },
+              {
+                "kind": "object",
+                "fields": {
+                  "id": {
+                    "kind": "string",
+                    "value": "c"
+                  },
+                  "score": {
+                    "kind": "number",
+                    "value": 5.0
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "kind": "pipe",
+          "var_name": "selected",
+          "source": {
+            "kind": "variable",
+            "name": "rows"
+          },
+          "operations": [
+            {
+              "kind": "closure",
+              "name": "filter",
+              "param": "row",
+              "value": {
+                "kind": "binary_op",
+                "left": {
+                  "kind": "property_access",
+                  "object": {
+                    "kind": "variable",
+                    "name": "row"
+                  },
+                  "field": "score"
+                },
+                "op": ">=",
+                "right": {
+                  "kind": "number",
+                  "value": 5.0
+                }
+              }
+            },
+            {
+              "kind": "closure",
+              "name": "map",
+              "param": "row",
+              "value": {
+                "kind": "object",
+                "fields": {
+                  "id": {
+                    "kind": "property_access",
+                    "object": {
+                      "kind": "variable",
+                      "name": "row"
+                    },
+                    "field": "id"
+                  },
+                  "score": {
+                    "kind": "property_access",
+                    "object": {
+                      "kind": "variable",
+                      "name": "row"
+                    },
+                    "field": "score"
+                  }
+                }
+              }
+            },
+            {
+              "kind": "expr",
+              "name": "take",
+              "value": {
+                "kind": "variable",
+                "name": "default_limit"
+              }
+            }
+          ]
+        }
+      ],
+      "response_status": 200,
+      "response_body": {
+        "items": {
+          "kind": "variable",
+          "name": "selected"
+        },
+        "seed": {
+          "kind": "variable",
+          "name": "seed"
+        }
+      },
+      "response_headers": {
+        "x-request-id": {
+          "kind": "variable",
+          "name": "id"
+        }
+      },
+      "response_cookies": {}
+    },
+    {
+      "method": "POST",
+      "path": "/v1/items",
+      "options": [],
+      "steps": [
+        {
+          "kind": "fetch_http",
+          "var_name": "created",
+          "config": {
+            "url": {
+              "kind": "binary_op",
+              "left": {
+                "kind": "variable",
+                "name": "api_base"
+              },
+              "op": "+",
+              "right": {
+                "kind": "string",
+                "value": "/items"
+              }
+            },
+            "method": "POST",
+            "body": {
+              "kind": "variable",
+              "name": "body"
+            },
+            "timeout_ms": 500,
+            "retries": 1,
+            "delay_ms": 25,
+            "fallback": {
+              "kind": "object",
+              "fields": {
+                "ok": {
+                  "kind": "boolean",
+                  "value": false
+                }
+              }
+            }
+          }
+        }
+      ],
+      "response_status": 201,
+      "response_body": {
+        "created": {
+          "kind": "variable",
+          "name": "created"
+        }
+      },
+      "response_headers": {},
+      "response_cookies": {}
+    }
+  ]
+}

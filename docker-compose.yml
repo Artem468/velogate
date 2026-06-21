@@ -1,0 +1,16 @@
+services:
+  velogate:
+    build:
+      context: .
+    ports:
+      - "8080:8080"
+    command:
+      - start
+      - --config
+      - /app/examples/main.gate
+      - --health-path
+      - /healthz
+      - --metrics-path
+      - /metrics
+    volumes:
+      - ./examples:/app/examples:ro

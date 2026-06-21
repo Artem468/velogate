@@ -30,6 +30,7 @@ dashmap = "6.1"
 ipnet = "2.11"
 
 tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.6.6", features = ["cors"] }
 sqlx = { version = "0.8.6", features = ["runtime-tokio-rustls", "any", "postgres", "mysql", "sqlite"] }
 tonic = "0.14.6"
 prost = "0.14.3"
